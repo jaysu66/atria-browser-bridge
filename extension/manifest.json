@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Atria Agent Browser Bridge",
+  "version": "0.1.0",
+  "description": "Local browser bridge for agent-controlled Chrome workflows.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "activeTab",
+    "alarms",
+    "debugger",
+    "scripting",
+    "storage",
+    "tabs",
+    "tabGroups"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "action": {
+    "default_title": "Atria 浏览器桥",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": [
+        "content/accessibility-tree.js",
+        "content/visual-indicator.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

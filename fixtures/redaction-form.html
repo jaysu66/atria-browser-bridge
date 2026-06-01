@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Atria Browser Bridge Redaction Fixture</title>
+    <style>
+      body {
+        margin: 32px;
+        font: 16px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #17211b;
+      }
+      form {
+        display: grid;
+        gap: 14px;
+        max-width: 420px;
+      }
+      label {
+        display: grid;
+        gap: 6px;
+      }
+      input,
+      textarea,
+      select,
+      button {
+        min-height: 36px;
+        border: 1px solid #cfc8bb;
+        border-radius: 8px;
+        padding: 6px 10px;
+        font: inherit;
+      }
+      button {
+        background: #22543d;
+        color: white;
+        cursor: pointer;
+      }
+      #result {
+        margin-top: 18px;
+        color: #22543d;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>浏览器桥表单验收</h1>
+      <p>这个页面用于验证 read_page、form_input、computer.click 和敏感字段隐藏。</p>
+      <form id="fixture-form">
+        <label>
+          用户名
+          <input name="username" autocomplete="username" placeholder="输入用户名">
+        </label>
+        <label>
+          密码
+          <input name="password" type="password" autocomplete="current-password" value="hunter2">
+        </label>
+        <label>
+          信用卡号
+          <input name="card" autocomplete="cc-number" value="4242424242424242">
+        </label>
+        <label>
+          城市
+          <select name="city">
+            <option>广州</option>
+            <option>上海</option>
+            <option>深圳</option>
+          </select>
+        </label>
+        <label>
+          备注
+          <textarea name="note" placeholder="输入备注"></textarea>
+        </label>
+        <button type="submit">提交表单</button>
+      </form>
+      <div id="result" role="status" aria-live="polite"></div>
+    </main>
+    <script>
+      document.getElementById("fixture-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        const username = new FormData(event.currentTarget).get("username") || "未填写";
+        document.getElementById("result").textContent = `已提交：${username}`;
+      });
+    </script>
+  </body>
+</html>

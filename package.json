@@ -1,0 +1,36 @@
+{
+  "name": "atria-browser-bridge",
+  "version": "0.1.0",
+  "description": "An MCP server + Chrome extension that gives any AI agent eyes and hands in your real, logged-in browser. Zero dependencies.",
+  "type": "commonjs",
+  "bin": {
+    "atria-browser-bridge": "mcp-server.js"
+  },
+  "main": "mcp-server.js",
+  "scripts": {
+    "start": "node mcp-server.js --standalone",
+    "smoke": "node scripts/smoke-mcp.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "browser",
+    "chrome",
+    "extension",
+    "ai-agent",
+    "browser-automation",
+    "web-scraping",
+    "cdp",
+    "accessibility-tree"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jaysu66/atria-browser-bridge.git"
+  },
+  "homepage": "https://github.com/jaysu66/atria-browser-bridge#readme",
+  "author": "Atria",
+  "license": "MIT"
+}

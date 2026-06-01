@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Atria 浏览器桥</title>
+    <style>
+      body {
+        width: 300px;
+        margin: 0;
+        padding: 16px;
+        font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #17211b;
+        background: #fbfaf6;
+      }
+      h1 {
+        margin: 0 0 10px;
+        font-size: 16px;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 8px 0;
+        border-top: 1px solid #e7e2d8;
+      }
+      .row:first-of-type {
+        border-top: 0;
+      }
+      .status {
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 12px;
+        background: #eee8dc;
+        color: #6d6558;
+      }
+      .status.ok {
+        background: #dff3e8;
+        color: #216246;
+      }
+      code {
+        font-size: 12px;
+        color: #6d6558;
+        word-break: break-all;
+      }
+      input {
+        width: 84px;
+        border: 1px solid #d9d2c5;
+        border-radius: 7px;
+        padding: 4px 6px;
+        background: #fff;
+        color: #17211b;
+        font: inherit;
+      }
+      button {
+        width: 100%;
+        margin-top: 12px;
+        border: 0;
+        border-radius: 8px;
+        padding: 9px 10px;
+        background: #22543d;
+        color: white;
+        font-weight: 600;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Atria 浏览器桥</h1>
+    <div class="row">
+      <span>本地桥接</span>
+      <span id="bridge-status" class="status">检测中</span>
+    </div>
+    <div class="row">
+      <span>扩展 ID</span>
+      <code id="extension-id"></code>
+    </div>
+    <div class="row">
+      <span>当前标签页</span>
+      <span id="tab-status" class="status">未知</span>
+    </div>
+    <div class="row">
+      <span>Bridge 端口</span>
+      <input id="bridge-port" inputmode="numeric" pattern="[0-9]*" aria-label="Bridge 端口">
+    </div>
+    <button id="ping">重新检测</button>
+    <script src="popup.js"></script>
+  </body>
+</html>
