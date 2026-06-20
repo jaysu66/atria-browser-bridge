@@ -207,9 +207,27 @@ function sanitizeText(value) {
   return text;
 }
 
+function normalizeImageBlock(block) {
+  if (!block || block.type !== 'image') return block;
+  const source = block.source && typeof block.source === 'object' ? block.source : null;
+  const mimeType = block.mimeType || block.mediaType || block.media_type || source?.mimeType || source?.mediaType || source?.media_type || 'image/jpeg';
+  const data = typeof block.data === 'string' ? block.data : (typeof source?.data === 'string' ? source.data : '');
+  if (!data.trim()) return { type: 'text', text: '[browser screenshot omitted: invalid image data]' };
+  const { media_type, mediaType, source: _source, ...rest } = block;
+  return { ...rest, type: 'image', mimeType, data };
+}
+
+function normalizeContentBlocks(result) {
+  if (!result || !Array.isArray(result.content)) return result;
+  return {
+    ...result,
+    content: result.content.map((block) => normalizeImageBlock(block)),
+  };
+}
+
 function sanitizeResult(result) {
   if (!result || typeof result !== 'object') return result;
-  const clone = JSON.parse(JSON.stringify(result));
+  const clone = normalizeContentBlocks(JSON.parse(JSON.stringify(result)));
   if (Array.isArray(clone.content)) {
     clone.content = clone.content.map((block) => {
       if (block && block.type === 'text' && typeof block.text === 'string') {
