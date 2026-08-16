@@ -383,6 +383,65 @@
     return { met: false, state, error: "no condition given" };
   }
 
+  // Shared by rectForRef and locate: scroll into view, then report the centre
+  // and whether anything is sitting on top of it.
+  function hitPointFor(el) {
+    el.scrollIntoView({ block: "center", inline: "center" });
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      return { ok: false, code: "not_visible", message: "element has no layout box" };
+    }
+    const x = Math.round(rect.left + rect.width / 2);
+    const y = Math.round(rect.top + rect.height / 2);
+    const hit = document.elementFromPoint(x, y);
+    const covered = !hit || !(hit === el || el.contains(hit) || hit.contains(el));
+    return {
+      ok: true,
+      x,
+      y,
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      covered,
+      hit: covered && hit ? hit.tagName.toLowerCase() : null
+    };
+  }
+
+  function locate(selector, predicateJs) {
+    let el = null;
+    if (predicateJs) {
+      // A predicate can express what a selector cannot — "the tile whose src
+      // contains this upload id" — which is exactly the case where no ref
+      // exists to aim at.
+      let test;
+      try {
+        test = eval(`(${predicateJs})`);
+      } catch (error) {
+        return { ok: false, code: "bad_predicate", message: `predicateJs did not compile: ${error.message}` };
+      }
+      const pool = Array.from(document.querySelectorAll(selector || "*"));
+      el = pool.find((candidate) => {
+        try {
+          return test(candidate);
+        } catch (_) {
+          return false;
+        }
+      });
+    } else if (selector) {
+      el = document.querySelector(selector);
+    }
+    if (!el) return { ok: false, code: "not_found", message: `nothing matched ${predicateJs || selector}` };
+    return { ...hitPointFor(el), selector, tag: el.tagName.toLowerCase() };
+  }
+
+  function evaluatePredicate(predicateJs) {
+    try {
+      const fn = eval(`(${predicateJs})`);
+      return { ok: true, value: typeof fn === "function" ? fn() : fn };
+    } catch (error) {
+      return { ok: false, code: "bad_predicate", message: error.message };
+    }
+  }
+
   function readValueByRef(ref) {
     const el = resolveRef(ref);
     if (!el) return { ok: false, code: "not_found", message: `ref not found: ${ref}` };
@@ -424,6 +483,18 @@
       }
       if (message.type === "atria.pageState") {
         sendResponse({ ok: true, state: pageState() });
+        return true;
+      }
+      if (message.type === "atria.locate") {
+        sendResponse(locate(message.selector, message.predicateJs));
+        return true;
+      }
+      if (message.type === "atria.evaluatePredicate") {
+        sendResponse(evaluatePredicate(message.predicateJs));
+        return true;
+      }
+      if (message.type === "atria.viewportCentre") {
+        sendResponse({ ok: true, x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2) });
         return true;
       }
       if (message.type === "atria.refRect") {

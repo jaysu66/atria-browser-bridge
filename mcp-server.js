@@ -324,6 +324,15 @@ server.on('upgrade', (req, socket) => {
   }
 });
 
+// Node closes an idle keep-alive socket after 5s by default. A caller that
+// reuses its connection between calls — anything driving the bridge in a loop —
+// can send on a socket the server is closing at that same moment and see an
+// intermittent ECONNRESET that looks like a bug in whatever tool it was calling.
+// Holding the socket open longer than any realistic gap between calls removes
+// the race. headersTimeout must stay above keepAliveTimeout.
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 70000;
+
 server.listen(PORT, HOST);
 
 function callBrowser(tool, args) {
@@ -484,15 +493,23 @@ const TOOLS = [
   },
   {
     name: 'computer',
-    description: 'Perform browser actions with real CDP input: left_click, right_click, double_click, type, key, scroll, scroll_to, wait, screenshot. Clicks and typing dispatch trusted events, so this works where synthetic DOM events are ignored. Pass ref and the element is located and scrolled into view first; typing is verified by reading the field back.',
+    description: 'Perform browser actions with real CDP input. Clicks, typing and scrolling dispatch trusted events, so this works where synthetic DOM events are ignored — canvas tiles, drag surfaces, rich editors and virtual lists. Pass ref and the element is located and scrolled into view first; typing is verified by reading the field back. click_where targets by selector or predicate when nothing in the tree names the element; scroll_until drives a virtual list with real wheel events until something appears.',
     inputSchema: {
       type: 'object',
       properties: {
         tabId: { type: 'number' },
         action: {
           type: 'string',
-          enum: ['left_click', 'right_click', 'double_click', 'type', 'key', 'scroll', 'scroll_to', 'wait', 'screenshot'],
+          enum: [
+            'left_click', 'right_click', 'double_click', 'type', 'key',
+            'scroll', 'scroll_until', 'scroll_to', 'click_where', 'wait', 'screenshot',
+          ],
         },
+        selector: { type: 'string', description: 'click_where / scroll_until: CSS selector for the target.' },
+        predicateJs: { type: 'string', description: 'click_where: arrow function picking the element, e.g. "el => el.src.includes(\'abc\')". Use when no selector or ref can name it.' },
+        verifyJs: { type: 'string', description: 'click_where: arrow function checked after the click; the call fails if it does not hold.' },
+        maxSteps: { type: 'number', default: 20, description: 'scroll_until: how many wheel steps before giving up.' },
+        settleMs: { type: 'number', description: 'Pause after each scroll step or click.' },
         ref: { type: 'string', description: 'Target element. For screenshot, crops to this element.' },
         coordinate: {},
         text: { type: 'string' },

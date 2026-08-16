@@ -72,7 +72,7 @@ Omitting `tabId` targets the current active tab.
 
 | Tool | Args | Purpose |
 |------|------|---------|
-| `computer` | `action` (required), `tabId`, `ref`, `coordinate`, `text`, `key`, `direction`, `amount`, `duration`, `clip`, `quality` | `left_click`, `right_click`, `double_click`, `type`, `key`, `scroll`, `scroll_to`, `wait`, `screenshot`. **Real CDP input.** |
+| `computer` | `action` (required), `tabId`, `ref`, `coordinate`, `selector`, `predicateJs`, `verifyJs`, `text`, `key`, `direction`, `amount`, `maxSteps`, `settleMs`, `clip`, `quality` | `left_click`, `right_click`, `double_click`, `type`, `key`, `scroll`, `scroll_until`, `scroll_to`, `click_where`, `wait`, `screenshot`. **All real CDP input.** |
 | `form_input` | `ref`, `value` (both required), `tabId` | Set a field directly. Verifies by reading back; fails with `write_not_applied` rather than claiming success. |
 | `file_upload` | `tabId`, `selector`, `file`, `files[]` | Attach local files via CDP. |
 | `wait_for` | `text` \| `selector` \| `urlRegex` \| `challengeGone`, `gone`, `timeoutMs`, `pollMs` | Block until a page condition holds. |
@@ -113,7 +113,13 @@ Omitting `tabId` targets the current active tab.
 
 **`form_input` vs `computer type`.** `form_input` writes the value directly and verifies by reading back — fast, and fine for plain inputs. If it returns `write_not_applied`, the editor rejected the write (ProseMirror, Lexical and friends often do); switch to `computer` with `action:"type"` and a `ref`, which clicks the field and types for real. Both verify, so neither will tell you a field is filled when it is not.
 
+**When nothing in the tree names the target**, do not hand-write a selector and click coordinates. Use `computer` with `action:"click_where"` and either `selector` or `predicateJs` (`el => el.src.includes('abc123')`). It locates, scrolls into view, refuses if something covers the target, clicks for real, and can confirm with `verifyJs` — one call, and the coordinates cannot go stale in between. This is the path for canvas tiles, image grids and anything the page draws itself.
+
+**Virtual lists need real wheel events.** `computer` `scroll` and `scroll_until` dispatch CDP wheel input, which is what makes an infinite feed load its next batch. Scrolling via `javascript_tool` (`scrollTop`, `scrollBy`) moves the viewport without firing `wheel`, so the list never loads. Use `scroll_until` with `selector` or `text` to keep scrolling until the target appears.
+
 **Prefer `read_page` / `get_page_text` over `screenshot`** for reading content — text is cheaper and more precise. Screenshot when layout or a visual result is the actual question.
+
+**Writing JS with regex escapes.** A `\s` or `\d` inside a hand-written JSON string is invalid JSON and has to be doubled. Avoid the problem entirely: write the script to a `.js` file and call `node "<skill-dir>/scripts/bridge.js" --js <file.js> [tabId]`.
 
 **Crawling a list.** `extract_page` with `scopeSelector` set to the card container returns `items[]` and `pagination.next` without the page chrome. For infinite scroll add `incremental:true` to get only what is new. If the list is driven by XHR, `network_start` then reading the JSON response beats parsing HTML. `set_request_blocking` with `["image","font","media"]` makes all of it several times faster.
 

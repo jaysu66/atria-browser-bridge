@@ -155,6 +155,26 @@ async function main() {
     check('request blocking drops images', cleared.blocked > 0 && images.every((r) => r.failed), `${cleared.blocked} blocked`);
     await call('network_stop', { tabId: blocked.id });
 
+    // The fixture only loads more tiles on a real wheel event, so this fails
+    // outright if scroll ever goes back to window.scrollBy in the page.
+    const virtual = await open(base('virtual-list.html'), true);
+    const before = json(await call('javascript_tool', { tabId: virtual.id, text: 'document.querySelectorAll(".tile").length' }));
+    const scrolled = await call('computer', { tabId: virtual.id, action: 'scroll_until', selector: '[data-tile="60"]', maxSteps: 15 });
+    const after = json(await call('javascript_tool', { tabId: virtual.id, text: 'document.querySelectorAll(".tile").length' }));
+    check(
+      'scroll_until drives a virtual list with real wheel events',
+      !scrolled.result.isError && Number(after.result) > Number(before.result),
+      `tiles ${before?.result} -> ${after?.result}, ${text(scrolled)}`
+    );
+
+    const clicked = await call('computer', {
+      tabId: virtual.id, action: 'click_where',
+      predicateJs: 'el => el.dataset && el.dataset.tile === "7"',
+      selector: '.tile',
+      verifyJs: '() => document.querySelector(\'[data-tile="7"]\') !== null',
+    });
+    check('click_where locates by predicate and clicks for real', !clicked.result.isError, text(clicked));
+
     const evaluated = json(await call('cdp_tool', { tabId: listing.id, method: 'Runtime.evaluate', params: { expression: '1+1', returnByValue: true } }));
     const refused = await call('cdp_tool', { tabId: listing.id, method: 'Browser.close' });
     check('cdp_tool works and refuses browser-process methods', evaluated?.result?.result?.value === 2 && refused.result.isError, 'Runtime.evaluate ok, Browser.close refused');

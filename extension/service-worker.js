@@ -432,6 +432,35 @@ async function clickAt(tabId, coordinate, button = "left", clickCount = 1) {
   });
 }
 
+// Real wheel events over CDP. window.scrollBy in the page is a synthetic scroll:
+// it moves the viewport but virtual lists, infinite feeds and custom scroll
+// containers listen for wheel input and never load their next batch from it.
+async function scrollWheel(tabId, args) {
+  const direction = String(args.scroll_direction || args.direction || "down").toLowerCase();
+  const amount = Math.abs(Number(args.scroll_amount || args.amount || 600));
+  const axis = direction === "left" || direction === "right" ? "x" : "y";
+  const sign = direction === "up" || direction === "left" ? -1 : 1;
+  let x = Math.round(Number(args.coordinate?.x ?? args.coordinate?.[0] ?? NaN));
+  let y = Math.round(Number(args.coordinate?.y ?? args.coordinate?.[1] ?? NaN));
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    // Aim at the middle of the viewport: the wheel event has to land over the
+    // scrollable container, not over whatever happens to be at 0,0.
+    const centre = await sendToContent(tabId, { type: "atria.viewportCentre" });
+    x = centre?.x ?? 400;
+    y = centre?.y ?? 300;
+  }
+  await withDebugger(tabId, (cdp) =>
+    cdp("Input.dispatchMouseEvent", {
+      type: "mouseWheel",
+      x,
+      y,
+      deltaX: axis === "x" ? sign * amount : 0,
+      deltaY: axis === "y" ? sign * amount : 0
+    })
+  );
+  return { direction, amount, at: { x, y } };
+}
+
 async function typeText(tabId, text) {
   return withDebugger(tabId, async (cdp) => {
     await cdp("Input.insertText", { text: String(text || "") });
@@ -1224,13 +1253,49 @@ async function executeTool(name, args) {
         return contentResult({ pressed: true, key: args.text || args.key || "Enter" });
       }
       if (action === "scroll") {
-        const result = await sendToContent(tab.id, {
-          type: "atria.scroll",
-          direction: args.scroll_direction || args.direction || "down",
-          amount: args.scroll_amount || args.amount || 600
-        });
-        if (!result?.ok) return toolError(result?.message || "scroll failed", result);
-        return contentResult({ scrolled: true });
+        const scrolled = await scrollWheel(tab.id, args);
+        return contentResult({ scrolled: true, ...scrolled });
+      }
+      if (action === "scroll_until") {
+        // Virtual lists only load more rows in response to a real wheel event,
+        // and only the page can say whether the thing being waited for has
+        // arrived. Looping here keeps that to one call instead of one round
+        // trip per scroll step.
+        const maxSteps = Math.max(1, Math.min(Number(args.maxSteps || 20), 100));
+        const condition = { selector: args.selector, text: args.text };
+        if (!condition.selector && !condition.text) {
+          return toolError("scroll_until needs selector or text", { code: "BAD_ARGS" });
+        }
+        for (let step = 0; step < maxSteps; step++) {
+          const hit = await sendToContent(tab.id, { type: "atria.checkCondition", condition });
+          if (hit?.met) return contentResult({ found: true, steps: step, ...condition });
+          await scrollWheel(tab.id, args);
+          await sleep(Number(args.settleMs || 400));
+        }
+        const final = await sendToContent(tab.id, { type: "atria.checkCondition", condition });
+        if (final?.met) return contentResult({ found: true, steps: maxSteps, ...condition });
+        return toolError(`scroll_until gave up after ${maxSteps} steps`, { code: "NOT_FOUND", found: false, ...condition });
+      }
+      if (action === "click_where") {
+        // For targets the accessibility tree cannot name — canvas tiles, image
+        // grids, anything the page draws itself. Locate, scroll into view and
+        // click in one call, so the coordinates cannot go stale in between.
+        const found = await sendToContent(tab.id, { type: "atria.locate", selector: args.selector, predicateJs: args.predicateJs });
+        if (!found?.ok) return toolError(found?.message || "click_where could not locate the element", { code: "NOT_FOUND" });
+        if (found.covered) {
+          return toolError(`target is covered by <${found.hit}> at (${found.x}, ${found.y})`, found);
+        }
+        await clickAt(tab.id, { x: found.x, y: found.y });
+        await sleep(Number(args.settleMs || 800));
+        let verified = null;
+        if (args.verifyJs) {
+          const check = await sendToContent(tab.id, { type: "atria.evaluatePredicate", predicateJs: args.verifyJs });
+          verified = Boolean(check?.value);
+          if (!verified) {
+            return toolError("clicked, but verifyJs did not hold afterwards", { clicked: true, verified: false, ...found });
+          }
+        }
+        return contentResult({ clicked: true, verified, rect: { x: found.x, y: found.y, width: found.width, height: found.height } });
       }
       if (action === "scroll_to") {
         const result = await sendToContent(tab.id, { type: "atria.scrollToRef", ref: args.ref });
@@ -1506,7 +1571,7 @@ async function pollOnce() {
   const response = await fetch(`${base}/extension/next?clientId=${encodeURIComponent(clientId)}&version=${encodeURIComponent(EXTENSION_VERSION)}&protocol=${PROTOCOL_VERSION}`, {
     cache: "no-store"
   });
-  if (response.status === 204) return;
+  if (response.status === 204) return false;
   if (!response.ok) throw new Error(`bridge HTTP ${response.status}`);
   const envelope = await response.json();
   const payload = await handleEnvelope(envelope).catch((error) => ({
@@ -1515,6 +1580,7 @@ async function pollOnce() {
     result: toolError(error?.message || String(error))
   }));
   await postJson("/extension/result", payload);
+  return true;
 }
 
 async function pollLoop() {
@@ -1522,8 +1588,14 @@ async function pollLoop() {
   polling = true;
   while (true) {
     try {
-      await pollOnce();
-      await sleep(350);
+      // Re-poll immediately after handling a command. /extension/next long-polls
+      // for up to 25s server-side, so this blocks there rather than spinning —
+      // whereas a fixed pause here was charged to every single command. It was
+      // 350ms, which was most of a local round trip, and a crawl pays it once
+      // per action. Only an empty poll backs off, and only enough to stop a
+      // tight loop if the server ever starts answering 204 immediately.
+      const handled = await pollOnce();
+      if (!handled) await sleep(50);
     } catch (_) {
       await sleep(1500);
     }
