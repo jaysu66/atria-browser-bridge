@@ -528,6 +528,11 @@ const TOOLS = [
     },
   },
   {
+    name: 'reload_extension',
+    description: 'Restart the Chrome extension so edited extension code takes effect, without the user having to click reload at chrome://extensions. Only useful when developing this bridge. It interrupts any command in flight, so do not call it while another task is driving the browser.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
     name: 'export_session',
     description: 'Export cookies and user agent for an origin so bulk fetching can move to a plain HTTP client, which is far faster than driving pages. Off by default and refused with PERMISSION_DENIED until the user enables it in the extension popup — the export is the site\'s login credentials in cleartext.',
     inputSchema: {

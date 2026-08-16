@@ -1308,6 +1308,21 @@ async function executeTool(name, args) {
     }
   }
 
+  if (name === "reload_extension") {
+    // Editing extension code does nothing until Chrome reloads it, and that is
+    // a manual click at chrome://extensions that no tool can reach — so an
+    // agent working on this bridge cannot verify its own changes. Reload from
+    // the inside instead. The service worker dies mid-call, so the result is
+    // posted first and the reload fires on the next tick.
+    setTimeout(() => chrome.runtime.reload(), 250);
+    return contentResult({
+      reloading: true,
+      version: EXTENSION_VERSION,
+      protocolVersion: PROTOCOL_VERSION,
+      note: "The extension is restarting. Wait ~2s, then check browser_status; content scripts re-inject on the next page load or tool call."
+    });
+  }
+
   if (name === "export_session") {
     const stored = await chrome.storage.local.get("atriaAllowSessionExport");
     if (!stored.atriaAllowSessionExport) {

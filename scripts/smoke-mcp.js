@@ -16,7 +16,7 @@ const EXPECTED_TOOLS = [
   'browser_batch', 'browser_parallel', 'wait_for', 'cdp_tool',
   'network_start', 'network_stop', 'network_list', 'network_detail',
   'set_request_blocking', 'clear_request_blocking',
-  'export_session', 'save_as_pdf',
+  'export_session', 'save_as_pdf', 'reload_extension',
 ];
 
 function requestHealth(port) {
