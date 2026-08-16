@@ -175,6 +175,13 @@ node scripts/smoke-mcp.js
 # HTTP health ok: atria-browser-bridge
 ```
 
+## Let your agent install it
+
+Paste the install prompt from [docs/使用指南.md](docs/使用指南.md#零让-agent-自己装推荐)
+into Claude Code, Kimi CLI, Cursor or Codex and it will clone the repo, run the
+self-check, install the skill and verify the connection. Only loading the
+unpacked extension needs a human.
+
 ## Use it as a Claude Code / Kimi CLI skill
 
 If your agent supports skills, `skills/atria-browser-bridge/` is a drop-in that

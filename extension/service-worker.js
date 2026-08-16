@@ -1091,11 +1091,15 @@ async function executeTool(name, args) {
       type: "atria.readPage",
       options: {
         filter: args.filter || "all",
-        depth: args.depth || 15,
+        // Pass depth through only when the caller set one. Defaulting here as
+        // well would pin the value and silently override the content script's
+        // own default, which is where the real limit is decided.
+        depth: args.depth,
         maxChars: args.maxChars || args.max_chars || 50000
       }
     });
     if (!result?.ok) return toolError(result?.message || "read_page failed", result);
+    const state = result.result.pageState;
     return {
       content: [
         {
@@ -1103,9 +1107,13 @@ async function executeTool(name, args) {
           text: [
             `URL: ${result.result.url}`,
             `Title: ${result.result.title}`,
+            state?.challenge ? `Challenge: ${state.challenge} — this is a bot check, not the page content` : null,
+            `Refs: ${result.result.entries.length}${result.result.truncated ? " (tree truncated)" : ""}`,
             "",
             result.result.tree
-          ].join("\n")
+          ]
+            .filter((line) => line !== null)
+            .join("\n")
         }
       ]
     };
