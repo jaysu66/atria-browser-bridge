@@ -793,7 +793,7 @@ async function executeTool(name, args) {
     const tab = await resolveTab(args.tabId);
     const result = await sendToContent(tab.id, { type: "atria.formInput", ref: args.ref, value: args.value });
     if (!result?.ok) return toolError(result?.message || "form_input failed", result);
-    return contentResult({ filled: true, ref: args.ref, matches_n: result.matches_n, match_level: result.match_level });
+    return contentResult({ filled: true, verified: true, ref: args.ref, length: result.length, checked: result.checked });
   }
 
   if (name === "file_upload") {
@@ -825,24 +825,50 @@ async function executeTool(name, args) {
         return contentResult({ waited: true });
       }
       if (action === "left_click" || action === "right_click" || action === "double_click") {
+        let coordinate = args.coordinate;
+        // A ref is resolved to live viewport coordinates and then clicked over
+        // CDP, same as a coordinate click. Dispatching el.click() here instead
+        // would make the ref path silently weaker than the coordinate path:
+        // canvas tiles, drag surfaces and many custom widgets ignore synthetic
+        // events entirely. Resolving on every call also means stale coordinates
+        // cannot be reused across a relayout.
         if (args.ref) {
-          const result = await sendToContent(tab.id, { type: "atria.clickRef", ref: args.ref });
-          if (!result?.ok) return toolError(result?.message || "click failed", result);
-          await sleep(800);
-          return contentResult({ clicked: true, ref: args.ref, matches_n: result.matches_n, match_level: result.match_level });
+          const spot = await sendToContent(tab.id, { type: "atria.refRect", ref: args.ref });
+          if (!spot?.ok) return toolError(spot?.message || "click failed", spot);
+          if (spot.covered) {
+            return toolError(
+              `${args.ref} is covered by <${spot.hit}> at (${spot.x}, ${spot.y}) — a real click would hit that instead. Dismiss the overlay first.`,
+              spot
+            );
+          }
+          coordinate = { x: spot.x, y: spot.y };
         }
-        await clickAt(tab.id, args.coordinate, action === "right_click" ? "right" : "left", action === "double_click" ? 2 : 1);
+        await clickAt(tab.id, coordinate, action === "right_click" ? "right" : "left", action === "double_click" ? 2 : 1);
         await sleep(800);
-        return contentResult({ clicked: true, coordinate: args.coordinate });
+        return contentResult({ clicked: true, ...(args.ref ? { ref: args.ref } : {}), coordinate });
       }
       if (action === "type") {
+        const text = args.text || "";
         if (args.ref) {
-          const result = await sendToContent(tab.id, { type: "atria.formInput", ref: args.ref, value: args.text || "" });
-          if (!result?.ok) return toolError(result?.message || "type failed", result);
-          return contentResult({ typed: true, ref: args.ref, matches_n: result.matches_n, match_level: result.match_level });
+          const spot = await sendToContent(tab.id, { type: "atria.refRect", ref: args.ref });
+          if (!spot?.ok) return toolError(spot?.message || "type failed", spot);
+          await clickAt(tab.id, { x: spot.x, y: spot.y });
+          await sleep(150);
         }
-        await typeText(tab.id, args.text || "");
-        return contentResult({ typed: true });
+        await typeText(tab.id, text);
+        if (!args.ref) return contentResult({ typed: true });
+        // Typing is only believable once the field reads back. Real key events
+        // append rather than replace, so the check is containment, not equality.
+        await sleep(150);
+        const check = await sendToContent(tab.id, { type: "atria.readValue", ref: args.ref });
+        const actual = check?.ok ? check.value : "";
+        if (text && !actual.includes(text)) {
+          return toolError(
+            `typed into ${args.ref} but it reads back without the text (${actual.length} chars present). The field may have rejected the input or moved focus.`,
+            { typed: false, ref: args.ref, verified: false, actual: actual.slice(0, 200) }
+          );
+        }
+        return contentResult({ typed: true, ref: args.ref, verified: true, length: actual.length });
       }
       if (action === "key") {
         await pressKey(tab.id, args.text || args.key || "Enter");

@@ -29,13 +29,23 @@
     "switch"
   ]);
 
-  function isVisible(el) {
-    if (!(el instanceof Element)) return false;
+  // "prune" — element and its whole subtree are genuinely hidden.
+  // "descend" — element itself is not worth reporting, but its children may be
+  //             on screen, so keep walking.
+  // "show"   — element is visible and reportable.
+  function visibilityOf(el) {
+    if (!(el instanceof Element)) return "prune";
     const style = window.getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+    // display:none and visibility:hidden really do hide descendants, so cutting
+    // the subtree is correct. A zero-size box or a transparent wrapper does not:
+    // overlay and portal containers routinely have no box of their own while the
+    // dialog inside them is fully on screen. Pruning on those was why buttons in
+    // popovers never reached the tree.
+    if (style.display === "none" || style.visibility === "hidden") return "prune";
+    if (Number(style.opacity) === 0) return "descend";
     const rect = el.getBoundingClientRect();
-    if (rect.width === 0 && rect.height === 0) return false;
-    return true;
+    if (rect.width === 0 && rect.height === 0) return "descend";
+    return "show";
   }
 
   function roleOf(el) {
@@ -142,19 +152,25 @@
 
   function walk(root, opts) {
     const entries = [];
-    const maxDepth = Math.max(1, Math.min(Number(opts.depth || 15), 40));
+    // 15 was too shallow for real apps: on a plain React page 4 of 52 visible
+    // interactive elements already sat below it, and anything inside a dialog
+    // sits deeper still. Output size is bounded by maxChars, not by depth.
+    const maxDepth = Math.max(1, Math.min(Number(opts.depth || 30), 100));
     const filter = opts.filter || "all";
 
     function visit(node, depth) {
       if (!(node instanceof Element)) return;
       if (depth > maxDepth || SKIP_TAGS.has(node.tagName)) return;
       const isRootNode = node === document.body || node === document.documentElement;
-      if (!isRootNode && !isVisible(node)) return;
+      const visibility = isRootNode ? "show" : visibilityOf(node);
+      if (visibility === "prune") return;
 
       const role = roleOf(node);
       const interactive = isInteractive(node, role);
       const name = labelFor(node).slice(0, 180);
-      const include = filter === "interactive" ? interactive : interactive || name || role !== "generic";
+      const include =
+        visibility === "show" &&
+        (filter === "interactive" ? interactive : interactive || name || role !== "generic");
       if (include) {
         const ref = interactive ? refFor(node) : null;
         const line = `${" ".repeat(depth)}${role}${name ? ` "${name}"` : ""}${ref ? ` [${ref}]` : ""}${attrsFor(node)}`;
@@ -195,7 +211,7 @@
   }
 
   function findByQuery(query) {
-    if (!state.entries.length) generatePageTree({ filter: "all", depth: 15, maxChars: 50000 });
+    if (!state.entries.length) generatePageTree({ filter: "all", maxChars: 50000 });
     const q = String(query || "").toLowerCase().trim();
     if (!q) return [];
     return state.entries
@@ -207,40 +223,128 @@
       .slice(0, 20);
   }
 
+  function readValue(el) {
+    if (el.isContentEditable) return el.textContent || "";
+    if ("value" in el && typeof el.value === "string") return el.value;
+    return "";
+  }
+
+  function insertIntoEditable(el, text) {
+    // Rich editors (ProseMirror, Lexical, Slate, Quill) own their DOM and drop
+    // direct textContent writes on the next render. execCommand("insertText")
+    // goes through beforeinput/input, which is the path their models listen on.
+    el.focus();
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    let applied = false;
+    try {
+      applied = document.execCommand("insertText", false, text);
+    } catch (_) {
+      applied = false;
+    }
+    if (!applied) el.textContent = text;
+  }
+
+  function setNativeValue(el, text) {
+    // React and friends patch the value setter and revert plain assignments on
+    // re-render. Going through the prototype setter is what makes their state
+    // actually pick the change up.
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value") || {};
+    if (typeof setter.set === "function") setter.set.call(el, text);
+    else el.value = text;
+  }
+
   function setValue(ref, value) {
     const el = resolveRef(ref);
     if (!el) return { ok: false, code: "not_found", message: `ref not found: ${ref}` };
     const tag = el.tagName;
     const type = (el.getAttribute("type") || "").toLowerCase();
+    const wanted = String(value);
+
     if (type === "checkbox" || type === "radio") {
       el.checked = Boolean(value);
     } else if (tag === "SELECT") {
-      el.value = String(value);
+      el.value = wanted;
     } else if (el.isContentEditable) {
-      el.textContent = String(value);
+      insertIntoEditable(el, wanted);
     } else if ("value" in el) {
-      el.value = String(value);
+      el.focus();
+      setNativeValue(el, wanted);
     } else {
       return { ok: false, code: "not_form_control", message: `${ref} is not writable` };
     }
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { ok: true, ref, matches_n: 1, match_level: "exact" };
+
+    if (type === "checkbox" || type === "radio") {
+      const applied = el.checked === Boolean(value);
+      if (applied) return { ok: true, verified: true, ref, checked: el.checked };
+      return { ok: false, verified: false, code: "write_not_applied", ref, checked: el.checked, message: `${ref} did not take the checked state` };
+    }
+
+    // Read the field back. An editor that ignores synthetic input still lets the
+    // DOM write "succeed", so the write means nothing until the value is
+    // confirmed present. Reporting success without this check is how a caller
+    // ends up submitting an empty form believing it was filled.
+    const actual = readValue(el);
+    if (actual.trim() === wanted.trim()) {
+      return { ok: true, verified: true, ref, length: actual.length };
+    }
+    return {
+      ok: false,
+      verified: false,
+      code: "write_not_applied",
+      ref,
+      expectedLength: wanted.length,
+      actualLength: actual.length,
+      actual: actual.slice(0, 200),
+      message: `${ref} still reads back differently after the write — the editor most likely rejected synthetic input. Retry with computer(action:"type", ref:"${ref}"), which clicks the field and types over real CDP input.`
+    };
   }
 
-  function clickRef(ref) {
+  function rectForRef(ref) {
     const el = resolveRef(ref);
     if (!el) return { ok: false, code: "not_found", message: `ref not found: ${ref}` };
     el.scrollIntoView({ block: "center", inline: "center" });
-    el.click();
-    return { ok: true, ref, matches_n: 1, match_level: "exact" };
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      return { ok: false, code: "not_visible", message: `${ref} has no layout box; it may be hidden or detached` };
+    }
+    const x = Math.round(rect.left + rect.width / 2);
+    const y = Math.round(rect.top + rect.height / 2);
+    // Whatever sits at that point is what a real click will hit. If it is not
+    // the target or related to it, something is covering the element and the
+    // click would land on the overlay instead.
+    const hit = document.elementFromPoint(x, y);
+    const covered = !hit || !(hit === el || el.contains(hit) || hit.contains(el));
+    return {
+      ok: true,
+      ref,
+      x,
+      y,
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      covered,
+      hit: covered && hit ? hit.tagName.toLowerCase() : null
+    };
+  }
+
+  function readValueByRef(ref) {
+    const el = resolveRef(ref);
+    if (!el) return { ok: false, code: "not_found", message: `ref not found: ${ref}` };
+    const value = readValue(el);
+    return { ok: true, ref, value: value.slice(0, 2000), length: value.length };
   }
 
   function scrollToRef(ref) {
     const el = resolveRef(ref);
     if (!el) return { ok: false, code: "not_found", message: `ref not found: ${ref}` };
     el.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
-    return { ok: true, ref, matches_n: 1, match_level: "exact" };
+    return { ok: true, ref };
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -264,8 +368,12 @@
         sendResponse(setValue(message.ref, message.value));
         return true;
       }
-      if (message.type === "atria.clickRef") {
-        sendResponse(clickRef(message.ref));
+      if (message.type === "atria.refRect") {
+        sendResponse(rectForRef(message.ref));
+        return true;
+      }
+      if (message.type === "atria.readValue") {
+        sendResponse(readValueByRef(message.ref));
         return true;
       }
       if (message.type === "atria.scrollToRef") {
