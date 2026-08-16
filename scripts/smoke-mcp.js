@@ -7,6 +7,18 @@ const root = path.resolve(__dirname, '..');
 const serverPath = path.join(root, 'mcp-server.js');
 const smokePort = Number(process.env.ATRIA_BROWSER_SMOKE_PORT || (48652 + Math.floor(Math.random() * 1000)));
 
+// Every tool the contract promises. A rename that misses one half of the
+// codebase shows up here rather than as a puzzling failure at call time.
+const EXPECTED_TOOLS = [
+  'browser_status', 'tabs_context', 'tabs_create', 'tabs_close', 'tabs_activate',
+  'navigate', 'read_page', 'get_page_text', 'extract_page', 'find',
+  'form_input', 'file_upload', 'computer', 'javascript_tool',
+  'browser_batch', 'browser_parallel', 'wait_for', 'cdp_tool',
+  'network_start', 'network_stop', 'network_list', 'network_detail',
+  'set_request_blocking', 'clear_request_blocking',
+  'export_session', 'save_as_pdf',
+];
+
 function requestHealth(port) {
   return new Promise((resolve, reject) => {
     const req = http.request(`http://127.0.0.1:${port}/health`, (res) => {
@@ -54,13 +66,26 @@ function runMcpSmoke() {
         const status = responses.find((item) => item.id === 3);
         if (!init?.result?.serverInfo) throw new Error('missing initialize result');
         const tools = list?.result?.tools || [];
-        for (const name of ['browser_status', 'tabs_context', 'navigate', 'read_page', 'extract_page', 'file_upload', 'computer', 'browser_batch']) {
+        for (const name of EXPECTED_TOOLS) {
           if (!tools.some((tool) => tool.name === name)) throw new Error(`missing tool: ${name}`);
         }
-        if (!status?.result?.content?.[0]?.text?.includes(`127.0.0.1:${smokePort}`)) {
+        for (const tool of tools) {
+          if (!tool.description) throw new Error(`tool without description: ${tool.name}`);
+          if (!tool.inputSchema || tool.inputSchema.type !== 'object') {
+            throw new Error(`tool with a bad inputSchema: ${tool.name}`);
+          }
+        }
+        const statusText = status?.result?.content?.[0]?.text || '';
+        if (!statusText.includes(`127.0.0.1:${smokePort}`)) {
           throw new Error('browser_status did not include local endpoint');
         }
-        resolve({ tools: tools.length, serverInfo: init.result.serverInfo });
+        // The version handshake is what tells a user their extension is stale,
+        // so a missing field here would silently disable that warning.
+        const parsedStatus = JSON.parse(statusText);
+        if (typeof parsedStatus.protocolVersion !== 'number') {
+          throw new Error('browser_status did not report protocolVersion');
+        }
+        resolve({ tools: tools.length, serverInfo: init.result.serverInfo, protocolVersion: parsedStatus.protocolVersion });
       } catch (error) {
         reject(error);
       }
@@ -75,7 +100,10 @@ function runMcpSmoke() {
 
 async function run() {
   const result = await runMcpSmoke();
-  console.log(`MCP smoke ok: ${result.tools} tools, server=${result.serverInfo.name}@${result.serverInfo.version}`);
+  console.log(
+    `MCP smoke ok: ${result.tools} tools (${EXPECTED_TOOLS.length} required present), ` +
+      `protocol=${result.protocolVersion}, server=${result.serverInfo.name}@${result.serverInfo.version}`
+  );
 
   const standalone = spawn(process.execPath, [serverPath, '--standalone'], {
     cwd: root,

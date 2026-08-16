@@ -39,6 +39,11 @@ const HOST = process.env.ATRIA_BROWSER_HOST || '127.0.0.1';
 const PORT = resolvePort();
 const REQUEST_TIMEOUT_MS = Number(process.env.ATRIA_BROWSER_REQUEST_TIMEOUT_MS || 60000);
 const STANDALONE = process.argv.includes('--standalone') || process.env.ATRIA_BROWSER_STANDALONE === '1';
+const MIN_INTERVAL_MS = Number(process.env.ATRIA_BROWSER_MIN_INTERVAL_MS || 0);
+// Bumped whenever the tool contract changes in a way an older extension cannot
+// serve. browser_status compares it against what the extension reports so a
+// stale extension is named as the cause instead of surfacing as odd failures.
+const PROTOCOL_VERSION = 2;
 
 const pendingQueue = [];
 const waiters = [];
@@ -48,6 +53,7 @@ const bridgeState = {
   startedAt: new Date().toISOString(),
   extensionClientId: null,
   extensionVersion: null,
+  protocolVersion: null,
   lastSeenAt: null,
 };
 
@@ -91,6 +97,8 @@ function markExtension(req) {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   bridgeState.extensionClientId = url.searchParams.get('clientId') || bridgeState.extensionClientId;
   bridgeState.extensionVersion = url.searchParams.get('version') || bridgeState.extensionVersion;
+  // Absent means an extension from before the handshake existed, i.e. protocol 1.
+  bridgeState.protocolVersion = Number(url.searchParams.get('protocol') || 1);
   bridgeState.lastSeenAt = new Date().toISOString();
 }
 
@@ -156,6 +164,20 @@ function attachExtensionSocket(req, socket) {
   });
 }
 
+// wait_for deliberately blocks until a page changes — often while a human
+// clears a bot check — so the transport must outlive its own timeout rather
+// than cutting the call off at the default and reporting a bridge failure.
+function timeoutFor(tool, args) {
+  if (tool === 'wait_for') {
+    const requested = Number(args?.timeoutMs || 30000);
+    return Math.min(Math.max(requested, 1000), 900000) + 15000;
+  }
+  // A batch is many steps in one call and may contain a wait_for of its own, so
+  // the default single-action budget does not apply.
+  if (tool === 'browser_batch' || tool === 'browser_parallel') return Math.max(REQUEST_TIMEOUT_MS, 300000);
+  return REQUEST_TIMEOUT_MS;
+}
+
 function enqueueTool(tool, args) {
   const id = crypto.randomUUID();
   const envelope = { id, tool, args: args || {}, createdAt: new Date().toISOString() };
@@ -164,7 +186,7 @@ function enqueueTool(tool, args) {
     const timer = setTimeout(() => {
       pendingResults.delete(id);
       reject(new Error(`browser bridge timeout waiting for ${tool}`));
-    }, REQUEST_TIMEOUT_MS);
+    }, timeoutFor(tool, args));
     pendingResults.set(id, { resolve, reject, timer });
   });
 
@@ -195,30 +217,6 @@ function nextEnvelope() {
 
     waiters.push(resolveEnvelope);
   });
-}
-
-function sanitizeText(value) {
-  let text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-  if (!text) return '';
-  text = text.replace(/document\.cookie\s*[:=][\s\S]{0,200}/gi, '[BLOCKED: cookie]');
-  text = text.replace(/\b(access_token|refresh_token|id_token|api[_-]?key|password|passwd|secret|token)=([^&\s]+)/gi, '$1=[BLOCKED]');
-  text = text.replace(/\b(authorization|bearer|access_token|refresh_token|id_token|api[_-]?key|secret|token)\b\s*[:=]\s*["']?(Bearer\s+)?[A-Za-z0-9+/_=-]{16,}/gi, '$1=[BLOCKED]');
-  text = text.replace(/\b(sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9_]{20,}|pk_live_[A-Za-z0-9_]{16,})\b/g, '[BLOCKED: api key]');
-  return text;
-}
-
-function sanitizeResult(result) {
-  if (!result || typeof result !== 'object') return result;
-  const clone = JSON.parse(JSON.stringify(result));
-  if (Array.isArray(clone.content)) {
-    clone.content = clone.content.map((block) => {
-      if (block && block.type === 'text' && typeof block.text === 'string') {
-        return { ...block, text: sanitizeText(block.text) };
-      }
-      return block;
-    });
-  }
-  return clone;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -280,7 +278,7 @@ const server = http.createServer(async (req, res) => {
       }
       pendingResults.delete(body.id);
       clearTimeout(entry.timer);
-      entry.resolve(sanitizeResult(body.result));
+      entry.resolve(body.result);
       jsonResponse(res, 200, { ok: true });
       return;
     }
@@ -318,6 +316,11 @@ function callBrowser(tool, args) {
       ],
     });
   }
+  // A global politeness floor belongs on the server, where every tab and every
+  // concurrent task passes through it, not in each caller's loop.
+  if (tool === 'navigate' && args && args.minIntervalMsPerDomain === undefined && MIN_INTERVAL_MS > 0) {
+    args = { ...args, minIntervalMsPerDomain: MIN_INTERVAL_MS };
+  }
   return enqueueTool(tool, args);
 }
 
@@ -340,7 +343,7 @@ const TOOLS = [
       properties: {
         url: { type: 'string' },
         active: { type: 'boolean', default: true },
-        group: { type: 'boolean', default: true, description: 'When true, put the tab into the Atria Agent Chrome tab group.' },
+        groupTitle: { type: 'string', description: 'Label for this task\'s tab group. Reuse one title for a whole task so its tabs stay together and separate from other tasks. Defaults to "Atria Agent".' },
       },
     },
   },
@@ -355,7 +358,7 @@ const TOOLS = [
   },
   {
     name: 'navigate',
-    description: 'Navigate a tab to a URL, or go back/forward.',
+    description: 'Navigate a tab to a URL, or go back/forward. The result carries pageState, so a bot check is visible immediately without a second call.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -363,12 +366,24 @@ const TOOLS = [
         url: { type: 'string' },
         direction: { type: 'string', enum: ['back', 'forward'] },
         timeoutMs: { type: 'number', default: 30000 },
+        recreateIfGone: { type: 'boolean', default: false, description: 'If the tab was closed, open a replacement instead of failing with TAB_GONE.' },
+        groupTitle: { type: 'string', description: 'Group title to use when recreating the tab.' },
+        minIntervalMsPerDomain: { type: 'number', description: 'Politeness delay between navigations to the same hostname. Defaults to ATRIA_BROWSER_MIN_INTERVAL_MS.' },
       },
     },
   },
   {
+    name: 'tabs_activate',
+    description: 'Bring a tab to the front and focus its window. Use this to put a page in front of the user when they need to act on it — solving a bot check, for example — instead of describing which tab to open.',
+    inputSchema: {
+      type: 'object',
+      properties: { tabId: { type: 'number' } },
+      required: ['tabId'],
+    },
+  },
+  {
     name: 'read_page',
-    description: 'Read the current page as an accessibility-style tree with stable refs such as [ref_1]. Sensitive values are redacted.',
+    description: 'Read the current page as an accessibility-style tree with stable refs such as [ref_1]. Returns page content verbatim, including form field values.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -392,7 +407,7 @@ const TOOLS = [
   },
   {
     name: 'extract_page',
-    description: 'Extract a structured crawl snapshot from the page: metadata, text sections, links, images, media, forms, tables, embeds, interactive elements, JSON-LD, and loaded resources.',
+    description: 'Extract a structured crawl snapshot: metadata, text sections, links, images, media, forms, tables, embeds, interactive elements, JSON-LD, loaded resources, plus detected listing items and the next-page link. On a list page, set scopeSelector to the card container — the surrounding chrome is usually most of the text and none of the data.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -402,6 +417,8 @@ const TOOLS = [
         includeResources: { type: 'boolean', default: true },
         autoScroll: { type: 'boolean', default: true },
         scrollSteps: { type: 'number', default: 8 },
+        scopeSelector: { type: 'string', description: 'Restrict extraction to this container. Page-level metadata stays document-wide.' },
+        incremental: { type: 'boolean', default: false, description: 'Return only items not seen on previous calls for this tab. For infinite scroll.' },
       },
     },
   },
@@ -445,7 +462,7 @@ const TOOLS = [
   },
   {
     name: 'computer',
-    description: 'Perform browser actions: left_click, right_click, double_click, type, key, scroll, scroll_to, wait, screenshot.',
+    description: 'Perform browser actions with real CDP input: left_click, right_click, double_click, type, key, scroll, scroll_to, wait, screenshot. Clicks and typing dispatch trusted events, so this works where synthetic DOM events are ignored. Pass ref and the element is located and scrolled into view first; typing is verified by reading the field back.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -454,20 +471,51 @@ const TOOLS = [
           type: 'string',
           enum: ['left_click', 'right_click', 'double_click', 'type', 'key', 'scroll', 'scroll_to', 'wait', 'screenshot'],
         },
-        ref: { type: 'string' },
+        ref: { type: 'string', description: 'Target element. For screenshot, crops to this element.' },
         coordinate: {},
         text: { type: 'string' },
         key: { type: 'string' },
         direction: { type: 'string' },
         amount: { type: 'number' },
         duration: { type: 'number' },
+        clip: {
+          type: 'object',
+          description: 'screenshot only: crop to this viewport rect.',
+          properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } },
+        },
+        quality: { type: 'number', default: 70, description: 'screenshot only: JPEG quality.' },
       },
       required: ['action'],
     },
   },
   {
+    name: 'export_session',
+    description: 'Export cookies and user agent for an origin so bulk fetching can move to a plain HTTP client, which is far faster than driving pages. Off by default and refused with PERMISSION_DENIED until the user enables it in the extension popup — the export is the site\'s login credentials in cleartext.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        origin: { type: 'string', description: 'Origin to export. Defaults to the tab\'s own origin.' },
+      },
+    },
+  },
+  {
+    name: 'save_as_pdf',
+    description: 'Render a tab to PDF via CDP and return it. Useful for archiving evidence of a page exactly as it rendered.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        paperFormat: { type: 'string', enum: ['letter', 'legal', 'tabloid', 'a3', 'a4'], default: 'letter' },
+        landscape: { type: 'boolean', default: false },
+        scale: { type: 'number', default: 1 },
+        printBackground: { type: 'boolean', default: true },
+      },
+    },
+  },
+  {
     name: 'javascript_tool',
-    description: 'Evaluate JavaScript in the page main world. Returns are sanitized by the local bridge.',
+    description: 'Evaluate JavaScript in the page main world. Returns are passed through verbatim.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -479,7 +527,7 @@ const TOOLS = [
   },
   {
     name: 'browser_batch',
-    description: 'Run browser tools sequentially. Stops at the first error. No nested browser_batch.',
+    description: 'Run browser tools sequentially in one round trip. Stops at the first error unless continueOnError is set. No nested browser_batch.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -494,9 +542,130 @@ const TOOLS = [
             required: ['name'],
           },
         },
+        continueOnError: { type: 'boolean', default: false, description: 'Run every step and report ok per step instead of stopping at the first failure.' },
       },
       required: ['actions'],
     },
+  },
+  {
+    name: 'browser_parallel',
+    description: 'Run several batches at the same time, one per tab. Use for crawling many pages at once: open N tabs, then give each its own navigate/extract sequence. Each batch is independent — one failing does not affect the others.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        batches: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              tabId: { type: 'number', description: 'Applied to every step in this batch.' },
+              continueOnError: { type: 'boolean', default: true },
+              actions: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: { name: { type: 'string' }, input: { type: 'object' } },
+                  required: ['name'],
+                },
+              },
+            },
+            required: ['actions'],
+          },
+        },
+      },
+      required: ['batches'],
+    },
+  },
+  {
+    name: 'wait_for',
+    description: 'Block until a page condition holds, then return. Use challengeGone:true after read_page reports pageState.challenge — tell the user to solve the bot check, then wait instead of polling in a loop. Also waits on text, a CSS selector, or a URL pattern; set gone:true to wait for the condition to stop holding.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        text: { type: 'string', description: 'Wait until this text appears in the page body.' },
+        selector: { type: 'string', description: 'Wait until this CSS selector matches.' },
+        urlRegex: { type: 'string', description: 'Wait until the tab URL matches this pattern.' },
+        gone: { type: 'boolean', default: false, description: 'Invert: wait for the condition to stop holding.' },
+        challengeGone: { type: 'boolean', default: false, description: 'Wait until no bot-check page is detected.' },
+        timeoutMs: { type: 'number', default: 30000, description: 'Up to 900000. Use a long value when a human has to act.' },
+        pollMs: { type: 'number', default: 1000 },
+      },
+    },
+  },
+  {
+    name: 'cdp_tool',
+    description: 'Send a raw Chrome DevTools Protocol command to a tab. Escape hatch for anything the named tools do not cover (Page.printToPDF, Emulation.*, Runtime.evaluate with awaitPromise). Browser-process and target-lifecycle methods are refused.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        method: { type: 'string', description: 'CDP method, e.g. "Page.captureScreenshot"' },
+        params: { type: 'object' },
+      },
+      required: ['method'],
+    },
+  },
+  {
+    name: 'network_start',
+    description: 'Begin recording network requests for a tab. Most list pages are driven by XHR/fetch JSON — capturing it lets you read the API payload directly instead of parsing HTML.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        filter: { type: 'string', description: 'Default substring filter applied by network_list.' },
+      },
+    },
+  },
+  {
+    name: 'network_stop',
+    description: 'Stop recording network requests for a tab and discard the buffer.',
+    inputSchema: { type: 'object', properties: { tabId: { type: 'number' } } },
+  },
+  {
+    name: 'network_list',
+    description: 'List captured requests. Keeps the most recent 200 per tab; truncated:true means older entries were dropped.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        filter: { type: 'string', description: 'Substring matched against url, method, resourceType and status.' },
+      },
+    },
+  },
+  {
+    name: 'network_detail',
+    description: 'Full record for one captured request, optionally including the response body (capped at 1 MB).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        requestId: { type: 'string' },
+        includeBody: { type: 'boolean', default: false },
+      },
+      required: ['requestId'],
+    },
+  },
+  {
+    name: 'set_request_blocking',
+    description: 'Block resource types or URL patterns in a tab. Images, fonts and media are most of a page\'s bytes; dropping them makes crawling several times faster. Survives navigation until cleared.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        resourceTypes: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'CDP resource types, lowercased: image, font, media, stylesheet, script, xhr, fetch.',
+        },
+        urlPatterns: { type: 'array', items: { type: 'string' }, description: 'Glob-style patterns, e.g. "*analytics*".' },
+      },
+    },
+  },
+  {
+    name: 'clear_request_blocking',
+    description: 'Stop blocking requests in a tab and report how many were blocked.',
+    inputSchema: { type: 'object', properties: { tabId: { type: 'number' } } },
   },
 ];
 
@@ -509,6 +678,13 @@ HANDLERS.browser_status = async () => ({
         {
           ok: true,
           endpoint: `http://${HOST}:${PORT}`,
+          protocolVersion: PROTOCOL_VERSION,
+          extensionProtocolVersion: bridgeState.protocolVersion ?? null,
+          versionWarning:
+            bridgeState.lastSeenAt && (bridgeState.protocolVersion ?? 1) < PROTOCOL_VERSION
+              ? `The connected extension speaks protocol ${bridgeState.protocolVersion ?? 1} but this server expects ${PROTOCOL_VERSION}. Reload the extension at chrome://extensions to pick up the newer tools.`
+              : null,
+          minIntervalMsPerDomain: MIN_INTERVAL_MS,
           bridgeState,
           pending: pendingQueue.length,
           waitingExtensionPolls: waiters.length,
@@ -545,7 +721,7 @@ rl.on('line', async (line) => {
       result: {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'atria-browser-bridge', version: '0.1.0' },
+        serverInfo: { name: 'atria-browser-bridge', version: '0.2.0' },
       },
     });
     return;

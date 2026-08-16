@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Atria Agent Browser Bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local browser bridge for agent-controlled Chrome workflows.",
   "minimum_chrome_version": "116",
   "permissions": [
     "activeTab",
     "alarms",
+    "cookies",
     "debugger",
     "scripting",
     "storage",

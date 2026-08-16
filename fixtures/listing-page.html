@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Atria Listing Fixture</title>
+    <style>
+      body { margin: 24px; font: 15px/1.5 system-ui, sans-serif; color: #17211b; }
+      .chrome { color: #8a948d; font-size: 13px; }
+      .grid { display: grid; gap: 10px; grid-template-columns: repeat(3, 1fr); margin: 18px 0; }
+      .card { border: 1px solid #d8d2c6; border-radius: 8px; padding: 10px; }
+      .card h3 { margin: 0 0 4px; font-size: 14px; }
+      .spacer { height: 4px; }
+    </style>
+  </head>
+  <body>
+    <!-- 页面 chrome:占大量文本但没有数据。scopeSelector 应当把这些排除掉。 -->
+    <header class="chrome">
+      <p>关于我们 · 联系方式 · 隐私政策 · 服务条款 · 招聘 · 帮助中心 · 网站地图 ·
+        品牌故事 · 投资者关系 · 新闻中心 · 供应商入驻 · 物流查询 · 售后政策 ·
+        发票申请 · 常见问题 · 意见反馈 · 无障碍声明 · Cookie 设置 · 廉洁举报</p>
+      <p>真实列表页的导航、页脚、侧栏、法务声明通常占全页文本的大头,而卡片数据只占一小部分。
+        这里刻意堆足这类文本,以便验证 scopeSelector 能把返回体积压下来。
+        本站所列信息仅供参考,不构成任何要约或承诺。价格、库存与交期以实际订单确认为准。
+        未经书面许可,不得以任何形式复制、抓取或用于商业用途。
+        本页展示的供应商资质由第三方提供,平台不对其真实性、完整性作出保证。
+        如需开具增值税专用发票,请在下单时填写完整开票信息,开票后不予变更。
+        跨境订单可能产生关税及清关费用,由收货方承担。运输时效受海关查验影响可能延长。
+        退换货须在签收后七日内提出,并保持商品及包装完好,定制类商品不支持无理由退换。</p>
+      <p>本段文字用于撑大全页文本量,以便验证 scopeSelector 能显著降低返回体积。
+        它重复出现在页眉和页脚,内容与列表数据完全无关。</p>
+    </header>
+
+    <!-- 干扰项:同构但无文本的 spacer,数量比卡片多。items 检测必须靠文本量
+         打破平局,选中 .card 而不是 .spacer。 -->
+    <div id="spacers">
+      <div class="spacer"></div><div class="spacer"></div><div class="spacer"></div>
+      <div class="spacer"></div><div class="spacer"></div><div class="spacer"></div>
+      <div class="spacer"></div><div class="spacer"></div><div class="spacer"></div>
+      <div class="spacer"></div><div class="spacer"></div><div class="spacer"></div>
+    </div>
+
+    <main>
+      <div class="grid" id="cards"></div>
+    </main>
+
+    <nav class="pagination">
+      <a href="?page=1">上一页</a>
+      <a href="?page=3">下一页</a>
+    </nav>
+
+    <footer class="chrome">
+      <p>关于我们 · 联系方式 · 隐私政策 · 服务条款 · 招聘 · 帮助中心 · 网站地图 ·
+        品牌故事 · 投资者关系 · 新闻中心 · 供应商入驻 · 物流查询 · 售后政策 ·
+        发票申请 · 常见问题 · 意见反馈 · 无障碍声明 · Cookie 设置 · 廉洁举报</p>
+      <p>真实列表页的导航、页脚、侧栏、法务声明通常占全页文本的大头,而卡片数据只占一小部分。
+        这里刻意堆足这类文本,以便验证 scopeSelector 能把返回体积压下来。
+        本站所列信息仅供参考,不构成任何要约或承诺。价格、库存与交期以实际订单确认为准。
+        未经书面许可,不得以任何形式复制、抓取或用于商业用途。
+        本页展示的供应商资质由第三方提供,平台不对其真实性、完整性作出保证。
+        如需开具增值税专用发票,请在下单时填写完整开票信息,开票后不予变更。
+        跨境订单可能产生关税及清关费用,由收货方承担。运输时效受海关查验影响可能延长。
+        退换货须在签收后七日内提出,并保持商品及包装完好,定制类商品不支持无理由退换。</p>
+    </footer>
+
+    <script>
+      const grid = document.getElementById("cards");
+      for (let i = 1; i <= 30; i++) {
+        const card = document.createElement("article");
+        card.className = "card";
+        card.innerHTML =
+          '<h3>供应商 ' + i + ' 号</h3>' +
+          '<p>面料代号 SKU-' + String(i).padStart(3, "0") + ',遮光率 ' + (i % 5) * 20 + '%。</p>' +
+          '<a href="/supplier/' + i + '">查看详情</a>';
+        grid.appendChild(card);
+      }
+    </script>
+  </body>
+</html>

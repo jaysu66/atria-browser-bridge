@@ -1,7 +1,11 @@
-const DEFAULT_BRIDGE_PORT = 47652;
+﻿const DEFAULT_BRIDGE_PORT = 47652;
 const BRIDGE_PORT_KEY = "atriaBridgePort";
 const EXTENSION_VERSION = chrome.runtime.getManifest().version;
 const AGENT_GROUP_TITLE = "Atria Agent";
+// Must match PROTOCOL_VERSION in mcp-server.js. Reported on every poll so the
+// server can tell the user "reload the extension" instead of leaving a stale
+// extension to fail in confusing ways.
+const PROTOCOL_VERSION = 2;
 const AGENT_GROUP_COLOR = "green";
 
 let clientIdPromise = null;
@@ -143,39 +147,86 @@ async function resolveTab(tabId) {
   return active;
 }
 
-async function getStoredAgentGroupId() {
-  const stored = await chrome.storage.local.get("atriaAgentTabGroupId");
-  const groupId = stored.atriaAgentTabGroupId;
+// Tabs are tracked per group title rather than as a single group, so two
+// concurrent tasks can each keep their own labelled group instead of piling
+// every tab they open into one undifferentiated pile.
+const GROUP_MAP_KEY = "atriaAgentTabGroups";
+
+async function readGroupMap() {
+  const stored = await chrome.storage.local.get(GROUP_MAP_KEY);
+  const map = stored[GROUP_MAP_KEY];
+  return map && typeof map === "object" ? map : {};
+}
+
+async function getStoredGroupId(title) {
+  const map = await readGroupMap();
+  const groupId = map[title];
   if (typeof groupId !== "number" || groupId < 0) return null;
   try {
     await chrome.tabGroups.get(groupId);
     return groupId;
   } catch (_) {
-    await chrome.storage.local.remove("atriaAgentTabGroupId");
+    delete map[title];
+    await chrome.storage.local.set({ [GROUP_MAP_KEY]: map });
     return null;
   }
 }
 
-async function groupAgentTab(tabId) {
-  let groupId = await getStoredAgentGroupId();
+async function listAgentGroups() {
+  const map = await readGroupMap();
+  const groups = [];
+  for (const [title, groupId] of Object.entries(map)) {
+    try {
+      const group = await chrome.tabGroups.get(groupId);
+      groups.push({ id: group.id, title: group.title || title, color: group.color, collapsed: group.collapsed, windowId: group.windowId });
+    } catch (_) {}
+  }
+  return groups;
+}
+
+async function groupAgentTab(tabId, groupTitle) {
+  const title = groupTitle ? String(groupTitle).slice(0, 60) : AGENT_GROUP_TITLE;
+  let groupId = await getStoredGroupId(title);
   if (groupId !== null) {
     try {
       groupId = await chrome.tabs.group({ tabIds: [tabId], groupId });
     } catch (_) {
       groupId = null;
-      await chrome.storage.local.remove("atriaAgentTabGroupId");
     }
   }
   if (groupId === null) {
     groupId = await chrome.tabs.group({ tabIds: [tabId] });
   }
   await chrome.tabGroups.update(groupId, {
-    title: AGENT_GROUP_TITLE,
+    title,
     color: AGENT_GROUP_COLOR,
     collapsed: false
   });
-  await chrome.storage.local.set({ atriaAgentTabGroupId: groupId });
+  const map = await readGroupMap();
+  map[title] = groupId;
+  await chrome.storage.local.set({ [GROUP_MAP_KEY]: map });
   return groupId;
+}
+
+// Politeness has to live here rather than in each agent's runner: with several
+// tabs crawling at once, per-runner pacing still lets them all hit one host
+// together. Keyed by hostname so unrelated domains never wait on each other.
+const domainLastHit = new Map();
+
+async function throttleDomain(url, override) {
+  const minInterval = Number(override ?? 0);
+  if (!Number.isFinite(minInterval) || minInterval <= 0) return 0;
+  let host;
+  try {
+    host = new URL(url).hostname;
+  } catch (_) {
+    return 0;
+  }
+  const last = domainLastHit.get(host) || 0;
+  const waitMs = Math.max(0, last + minInterval - Date.now());
+  if (waitMs > 0) await sleep(waitMs);
+  domainLastHit.set(host, Date.now());
+  return waitMs;
 }
 
 function waitForTabLoad(tabId, timeoutMs = 30000) {
@@ -244,6 +295,131 @@ async function withDebugger(tabId, fn) {
     }
   }
 }
+
+// Methods that would take the browser away from the user rather than drive a
+// page. The bridge exists to operate tabs, not to control the browser process.
+const CDP_DENIED = /^(Browser\.|Target\.(close|createTarget|disposeBrowserContext)|Page\.close|Storage\.clearDataForOrigin)/;
+
+// Inches, as Page.printToPDF expects.
+const PAPER_SIZES = {
+  letter: [8.5, 11],
+  legal: [8.5, 14],
+  tabloid: [11, 17],
+  a3: [11.7, 16.5],
+  a4: [8.27, 11.7]
+};
+
+// withDebugger attaches and detaches around a single call, which suits one-shot
+// commands but cannot receive events. Network capture and request blocking need
+// the attachment to outlive the call, so those tabs get a session here and the
+// attachment is released only when the last consumer stops.
+const cdpSessions = new Map();
+
+function cdpSession(tabId) {
+  let session = cdpSessions.get(tabId);
+  if (!session) {
+    session = { tabId, consumers: new Set(), network: null, blocking: null };
+    cdpSessions.set(tabId, session);
+  }
+  return session;
+}
+
+async function attachPersistent(tabId, consumer) {
+  const session = cdpSession(tabId);
+  if (!session.consumers.size) {
+    try {
+      await chrome.debugger.attach({ tabId }, "1.3");
+    } catch (error) {
+      if (!String(error?.message || error).includes("Another debugger is already attached")) throw error;
+    }
+  }
+  session.consumers.add(consumer);
+  return session;
+}
+
+async function detachPersistent(tabId, consumer) {
+  const session = cdpSessions.get(tabId);
+  if (!session) return;
+  session.consumers.delete(consumer);
+  if (session.consumers.size) return;
+  cdpSessions.delete(tabId);
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch (_) {}
+}
+
+function cdpSend(tabId, method, params) {
+  return chrome.debugger.sendCommand({ tabId }, method, params || {});
+}
+
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId !== undefined) cdpSessions.delete(source.tabId);
+});
+
+const NETWORK_MAX_RECORDS = 200;
+const NETWORK_MAX_BODY_BYTES = 1024 * 1024;
+
+function networkMatches(record, filter) {
+  if (!filter) return true;
+  const needle = String(filter).toLowerCase();
+  return `${record.url} ${record.method} ${record.resourceType} ${record.status || ""}`.toLowerCase().includes(needle);
+}
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  const session = source.tabId !== undefined ? cdpSessions.get(source.tabId) : null;
+  if (!session) return;
+
+  if (session.blocking && method === "Fetch.requestPaused") {
+    const { requestId, request, resourceType } = params || {};
+    const blocked =
+      session.blocking.resourceTypes.includes(String(resourceType || "").toLowerCase()) ||
+      session.blocking.urlPatterns.some((pattern) => pattern.test(request?.url || ""));
+    const command = blocked
+      ? cdpSend(source.tabId, "Fetch.failRequest", { requestId, errorReason: "BlockedByClient" })
+      : cdpSend(source.tabId, "Fetch.continueRequest", { requestId });
+    if (blocked) session.blocking.blocked += 1;
+    command.catch(() => {});
+    return;
+  }
+
+  const capture = session.network;
+  if (!capture) return;
+
+  if (method === "Network.requestWillBeSent") {
+    if (capture.records.length >= NETWORK_MAX_RECORDS) {
+      capture.records.shift();
+      capture.truncated = true;
+    }
+    capture.records.push({
+      requestId: params.requestId,
+      url: params.request?.url || "",
+      method: params.request?.method || "",
+      resourceType: String(params.type || "").toLowerCase(),
+      requestHeaders: params.request?.headers || {},
+      postData: params.request?.postData ? String(params.request.postData).slice(0, 4000) : undefined,
+      startedAt: params.wallTime,
+      status: null
+    });
+    return;
+  }
+  if (method === "Network.responseReceived") {
+    const record = capture.records.find((item) => item.requestId === params.requestId);
+    if (record) {
+      record.status = params.response?.status ?? null;
+      record.mimeType = params.response?.mimeType || "";
+      record.responseHeaders = params.response?.headers || {};
+    }
+    return;
+  }
+  if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
+    const record = capture.records.find((item) => item.requestId === params.requestId);
+    if (record) {
+      record.finished = true;
+      record.encodedDataLength = params.encodedDataLength;
+      if (method === "Network.loadingFailed") record.failed = params.errorText || "failed";
+    }
+  }
+});
 
 async function clickAt(tabId, coordinate, button = "left", clickCount = 1) {
   const x = Math.round(Number(coordinate?.x ?? coordinate?.[0]));
@@ -414,6 +590,8 @@ async function autoScrollPage(tabId, steps) {
   });
 }
 
+const seenItems = new Map();
+
 async function extractPage(tab, args) {
   if (args.autoScroll !== false) {
     await autoScrollPage(tab.id, args.scrollSteps || 8);
@@ -461,13 +639,7 @@ async function extractPage(tab, args) {
         if (wrapped) return clean(wrapped.innerText);
         return clean(el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.getAttribute("name") || "");
       };
-      const sensitive = (el) => {
-        const type = (el.getAttribute("type") || "").toLowerCase();
-        const name = `${el.getAttribute("name") || ""} ${el.getAttribute("id") || ""} ${el.getAttribute("autocomplete") || ""}`.toLowerCase();
-        return type === "password" || type === "hidden" || /(password|token|secret|otp|one-time|cc-|credit|card|cvv|cvc)/.test(name);
-      };
       const fieldValue = (el) => {
-        if (sensitive(el)) return "[value redacted]";
         if (el.tagName === "SELECT") {
           return Array.from(el.selectedOptions || []).map((option) => option.value || option.textContent).join(", ");
         }
@@ -475,6 +647,67 @@ async function extractPage(tab, args) {
         return trim(el.value, 300);
       };
       const limited = (items) => items.slice(0, maxItems);
+      // Scoping to a container is what makes list-page extraction affordable:
+      // the surrounding chrome is usually most of the text and none of the data.
+      // Page-level facts (meta, JSON-LD, resources) stay document-wide.
+      const scopeEl = options.scopeSelector ? document.querySelector(options.scopeSelector) : null;
+      const root = scopeEl || document.body || document.documentElement;
+      const scoped = (selector) => Array.from(root.querySelectorAll(selector));
+      // Pagination: rel=next is authoritative; otherwise fall back to link text.
+      const NEXT_TEXT = /^(next|next page|older|more|下一页|下页|下一頁|次へ|»|›|>)$/i;
+      const paginationOf = () => {
+        const rel = document.querySelector("link[rel=next], a[rel=next]");
+        if (rel) return { next: absUrl(rel.getAttribute("href")), source: "rel=next" };
+        const anchors = scoped("a[href]").concat(Array.from(document.querySelectorAll("nav a[href], .pagination a[href]")));
+        const hit = anchors.find(
+          (a) => NEXT_TEXT.test(clean(a.innerText)) || NEXT_TEXT.test(clean(a.getAttribute("aria-label")))
+        );
+        return hit ? { next: absUrl(hit.getAttribute("href")), source: "text" } : { next: null, source: null };
+      };
+
+      // A listing is N sibling nodes that share a shape. Grouping siblings by
+      // tag plus leading class names finds the card container without needing a
+      // per-site selector, which is what makes this reusable across platforms.
+      const itemsOf = () => {
+        const byParent = new Map();
+        for (const el of scoped("*")) {
+          const parent = el.parentElement;
+          if (!parent) continue;
+          let signatures = byParent.get(parent);
+          if (!signatures) {
+            signatures = new Map();
+            byParent.set(parent, signatures);
+          }
+          const cls = typeof el.className === "string" ? el.className.trim().split(/\s+/).slice(0, 2).join(".") : "";
+          const signature = `${el.tagName}.${cls}`;
+          if (!signatures.has(signature)) signatures.set(signature, []);
+          signatures.get(signature).push(el);
+        }
+        let best = [];
+        let bestText = 0;
+        for (const signatures of byParent.values()) {
+          for (const list of signatures.values()) {
+            if (list.length < 3) continue;
+            const textLen = list.reduce((sum, el) => sum + (el.innerText || "").length, 0);
+            // Most members wins; ties break on total text so grids of spacer
+            // divs lose to grids of actual cards.
+            if (list.length > best.length || (list.length === best.length && textLen > bestText)) {
+              best = list;
+              bestText = textLen;
+            }
+          }
+        }
+        return limited(
+          best
+            .map((el) => ({
+              text: trim(el.innerText, 500),
+              hrefs: Array.from(el.querySelectorAll("a[href]")).slice(0, 5).map((a) => absUrl(a.getAttribute("href"))),
+              images: Array.from(el.querySelectorAll("img[src]")).slice(0, 3).map((img) => absUrl(img.getAttribute("src")))
+            }))
+            .filter((item) => item.text || item.hrefs.length)
+        );
+      };
+
       const metaTags = {};
       for (const meta of Array.from(document.querySelectorAll("meta"))) {
         const key = meta.getAttribute("name") || meta.getAttribute("property") || meta.getAttribute("http-equiv");
@@ -488,14 +721,14 @@ async function extractPage(tab, args) {
           return { parseError: true, raw: raw.slice(0, 2000) };
         }
       });
-      const headings = limited(Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6")).map((el) => ({
+      const headings = limited(scoped("h1,h2,h3,h4,h5,h6").map((el) => ({
         level: Number(el.tagName.slice(1)),
         text: trim(el.innerText, 500),
         visible: visible(el),
         rect: rectOf(el)
       })).filter((item) => item.text));
-      const paragraphs = limited(Array.from(document.querySelectorAll("p,article li,main li")).map((el) => trim(el.innerText, 1000)).filter((text) => text.length > 20));
-      const links = limited(Array.from(document.querySelectorAll("a[href]")).map((el) => ({
+      const paragraphs = limited(scoped("p,article li,main li").map((el) => trim(el.innerText, 1000)).filter((text) => text.length > 20));
+      const links = limited(scoped("a[href]").map((el) => ({
         text: trim(el.innerText || el.getAttribute("aria-label") || el.getAttribute("title"), 300),
         href: absUrl(el.getAttribute("href")),
         title: el.getAttribute("title") || "",
@@ -504,7 +737,7 @@ async function extractPage(tab, args) {
         visible: visible(el),
         rect: rectOf(el)
       })).filter((item) => item.href));
-      const images = limited(Array.from(document.images).map((img) => ({
+      const images = limited(scoped("img").map((img) => ({
         src: absUrl(img.currentSrc || img.src),
         srcset: img.getAttribute("srcset") || "",
         alt: img.getAttribute("alt") || "",
@@ -515,13 +748,13 @@ async function extractPage(tab, args) {
         visible: visible(img),
         rect: rectOf(img)
       })).filter((item) => item.src));
-      const backgroundImages = limited(Array.from(document.querySelectorAll("body *")).map((el) => {
+      const backgroundImages = limited(scoped("*").map((el) => {
         const bg = getComputedStyle(el).backgroundImage || "";
         const matches = Array.from(bg.matchAll(/url\(["']?([^"')]+)["']?\)/g)).map((match) => absUrl(match[1]));
         if (!matches.length) return null;
         return { urls: matches, text: trim(el.innerText, 160), visible: visible(el), rect: rectOf(el) };
       }).filter(Boolean));
-      const media = limited(Array.from(document.querySelectorAll("video,audio")).map((el) => ({
+      const media = limited(scoped("video,audio").map((el) => ({
         tag: el.tagName.toLowerCase(),
         src: absUrl(el.currentSrc || el.src || ""),
         poster: absUrl(el.getAttribute("poster") || ""),
@@ -536,7 +769,7 @@ async function extractPage(tab, args) {
         visible: visible(el),
         rect: rectOf(el)
       })));
-      const embeds = limited(Array.from(document.querySelectorAll("iframe,embed,object")).map((el) => ({
+      const embeds = limited(scoped("iframe,embed,object").map((el) => ({
         tag: el.tagName.toLowerCase(),
         src: absUrl(el.getAttribute("src") || el.getAttribute("data") || ""),
         title: el.getAttribute("title") || el.getAttribute("aria-label") || "",
@@ -544,7 +777,7 @@ async function extractPage(tab, args) {
         visible: visible(el),
         rect: rectOf(el)
       })));
-      const forms = limited(Array.from(document.forms).map((form) => ({
+      const forms = limited(scoped("form").map((form) => ({
         id: form.id || "",
         name: form.getAttribute("name") || "",
         action: absUrl(form.getAttribute("action") || location.href),
@@ -564,11 +797,11 @@ async function extractPage(tab, args) {
           rect: rectOf(el)
         }))
       })));
-      const tables = limited(Array.from(document.querySelectorAll("table")).map((table) => {
+      const tables = limited(scoped("table").map((table) => {
         const rows = Array.from(table.rows).slice(0, 50).map((row) => Array.from(row.cells).slice(0, 20).map((cell) => trim(cell.innerText, 300)));
         return { caption: trim(table.caption?.innerText || "", 300), rows, visible: visible(table), rect: rectOf(table) };
       }));
-      const interactive = limited(Array.from(document.querySelectorAll("a[href],button,input,select,textarea,summary,[role='button'],[role='link'],[contenteditable='true']")).map((el) => ({
+      const interactive = limited(scoped("a[href],button,input,select,textarea,summary,[role='button'],[role='link'],[contenteditable='true']").map((el) => ({
         tag: el.tagName.toLowerCase(),
         role: el.getAttribute("role") || "",
         text: trim(el.innerText || el.value || el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.getAttribute("title"), 300),
@@ -584,7 +817,7 @@ async function extractPage(tab, args) {
         transferSize: entry.transferSize || 0,
         encodedBodySize: entry.encodedBodySize || 0
       })));
-      const text = clean(document.body?.innerText || "").slice(0, maxTextChars);
+      const text = clean(root.innerText || "").slice(0, maxTextChars);
       return {
         meta: {
           url: location.href,
@@ -597,6 +830,9 @@ async function extractPage(tab, args) {
           twitter: Object.fromEntries(Object.entries(metaTags).filter(([key]) => key.startsWith("twitter:"))),
           viewport: { width: window.innerWidth, height: window.innerHeight, scrollHeight: document.documentElement.scrollHeight }
         },
+        scope: options.scopeSelector ? { selector: options.scopeSelector, matched: Boolean(scopeEl) } : null,
+        pagination: paginationOf(),
+        items: itemsOf(),
         text: { length: text.length, visibleText: text, headings, paragraphs },
         links,
         images,
@@ -627,22 +863,97 @@ async function extractPage(tab, args) {
       maxItems: args.maxItems,
       maxTextChars: args.maxTextChars || args.max_text_chars,
       includeResources: args.includeResources ?? args.include_resources,
+      scopeSelector: args.scopeSelector || null,
     }]
   });
-  return contentResult(injection[0]?.result || {});
+  const extracted = injection[0]?.result || {};
+
+  // Infinite-scroll pages re-serve everything already seen on each pass, so a
+  // crawler paying per token wants only what is new since the last call. Keyed
+  // per tab and reset whenever the URL changes.
+  if (args.incremental) {
+    const seen = seenItems.get(tab.id);
+    const fresh = seen && seen.url === extracted.url ? seen.keys : new Set();
+    const before = (extracted.items || []).length;
+    extracted.items = (extracted.items || []).filter((item) => {
+      const key = `${item.text}|${item.hrefs.join(",")}`;
+      if (fresh.has(key)) return false;
+      fresh.add(key);
+      return true;
+    });
+    extracted.incremental = { newItems: extracted.items.length, suppressed: before - extracted.items.length };
+    seenItems.set(tab.id, { url: extracted.url, keys: fresh });
+  }
+  // Surface the bot-check verdict here too. A crawler that only calls
+  // extract_page would otherwise happily "extract" a challenge page.
+  try {
+    const state = await sendToContent(tab.id, { type: "atria.pageState" });
+    if (state?.ok) extracted.pageState = state.state;
+  } catch (_) {}
+  return contentResult(extracted);
 }
 
-async function captureScreenshot(tab) {
+async function captureScreenshot(tab, args = {}) {
+  let clip = args.clip || null;
+  if (!clip && args.ref) {
+    const spot = await sendToContent(tab.id, { type: "atria.refRect", ref: args.ref });
+    if (!spot?.ok) return toolError(spot?.message || `cannot locate ${args.ref}`, { code: "NOT_FOUND" });
+    clip = { x: spot.x - spot.width / 2, y: spot.y - spot.height / 2, width: spot.width, height: spot.height };
+  }
+  // A clip is a CDP-only capability, and it also needs page coordinates rather
+  // than viewport ones, so scroll offset has to be added back in.
+  if (clip) {
+    const offset = await withDebugger(tab.id, async (cdp) => {
+      const result = await cdp("Runtime.evaluate", { expression: "JSON.stringify({x:scrollX,y:scrollY})", returnByValue: true });
+      try {
+        return JSON.parse(result?.result?.value || "{}");
+      } catch (_) {
+        return {};
+      }
+    });
+    const shot = await withDebugger(tab.id, async (cdp) => {
+      await cdp("Page.enable");
+      return cdp("Page.captureScreenshot", {
+        format: "jpeg",
+        quality: Number(args.quality || 70),
+        captureBeyondViewport: true,
+        clip: {
+          x: Math.max(0, Math.round(clip.x + (offset.x || 0))),
+          y: Math.max(0, Math.round(clip.y + (offset.y || 0))),
+          width: Math.max(1, Math.round(clip.width)),
+          height: Math.max(1, Math.round(clip.height)),
+          scale: 1
+        }
+      });
+    });
+    if (!shot?.data) return captureDomSnapshot(tab, "clip screenshot returned empty image");
+    return {
+      content: [
+        { type: "image", mimeType: "image/jpeg", data: shot.data },
+        { type: "text", text: `Clipped screenshot from tab ${tab.id} via debugger.Page.captureScreenshot` }
+      ]
+    };
+  }
+
   let data = "";
   let method = "tabs.captureVisibleTab";
-  try {
-    const dataUrl = await withTimeout(
-      chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 70 }),
-      5000,
-      "tabs.captureVisibleTab timeout"
-    );
-    [, data = ""] = dataUrl.split(",");
-  } catch (_) {
+  // captureVisibleTab only takes a windowId, so it grabs whatever tab is visible
+  // there and ignores tab.id. On a background tab that returns a picture of the
+  // page the user is actually looking at. Restrict it to the active tab and let
+  // CDP handle the rest, since Page.captureScreenshot targets the tab directly.
+  if (tab.active) {
+    try {
+      const dataUrl = await withTimeout(
+        chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 70 }),
+        5000,
+        "tabs.captureVisibleTab timeout"
+      );
+      [, data = ""] = dataUrl.split(",");
+    } catch (_) {
+      data = "";
+    }
+  }
+  if (!data) {
     method = "debugger.Page.captureScreenshot";
     try {
       const result = await withTimeout(
@@ -681,23 +992,17 @@ async function executeTool(name, args) {
 
   if (name === "tabs_context") {
     const tabs = await chrome.tabs.query({});
-    let agentGroup = null;
-    const groupId = await getStoredAgentGroupId();
-    if (groupId !== null) {
-      try {
-        const group = await chrome.tabGroups.get(groupId);
-        agentGroup = { id: group.id, title: group.title, color: group.color, collapsed: group.collapsed, windowId: group.windowId };
-      } catch (_) {
-        agentGroup = null;
-      }
-    }
+    const agentGroups = await listAgentGroups();
+    const byId = new Map(agentGroups.map((group) => [group.id, group]));
     return contentResult({
-      agentGroup,
+      agentGroups,
+      agentGroup: agentGroups.find((group) => group.title === AGENT_GROUP_TITLE) || agentGroups[0] || null,
       tabs: tabs.map((tab) => ({
         id: tab.id,
         windowId: tab.windowId,
         groupId: tab.groupId,
-        isAgentTab: agentGroup ? tab.groupId === agentGroup.id : false,
+        isAgentTab: byId.has(tab.groupId),
+        agentGroupTitle: byId.get(tab.groupId)?.title || null,
         active: tab.active,
         title: tab.title,
         url: tab.url
@@ -710,9 +1015,29 @@ async function executeTool(name, args) {
     let groupId = tab.groupId;
     // 强制进 Atria Agent group,LLM 不可绕过(忽略 args.group 旧字段)
     if (tab.id !== undefined) {
-      groupId = await groupAgentTab(tab.id);
+      groupId = await groupAgentTab(tab.id, args.groupTitle);
     }
-    return contentResult({ id: tab.id, windowId: tab.windowId, groupId, agentGroupTitle: groupId >= 0 ? AGENT_GROUP_TITLE : null, url: tab.url, title: tab.title });
+    const title = args.groupTitle ? String(args.groupTitle) : AGENT_GROUP_TITLE;
+    return contentResult({ id: tab.id, windowId: tab.windowId, groupId, agentGroupTitle: groupId >= 0 ? title : null, url: tab.url, title: tab.title });
+  }
+
+  if (name === "tabs_activate") {
+    if (args.tabId === undefined || args.tabId === null) return toolError("tabId is required", { code: "BAD_ARGS" });
+    const tabId = Number(args.tabId);
+    let tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch (_) {
+      return toolError(`tab ${tabId} no longer exists`, { code: "TAB_GONE", tabId });
+    }
+    // Bringing the window forward matters as much as selecting the tab: this
+    // exists so the agent can put a bot check in front of the user instead of
+    // describing which tab to go find.
+    await chrome.tabs.update(tabId, { active: true });
+    try {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    } catch (_) {}
+    return contentResult({ activated: true, tabId, windowId: tab.windowId, url: tab.url, title: tab.title });
   }
 
   if (name === "tabs_close") {
@@ -722,7 +1047,20 @@ async function executeTool(name, args) {
   }
 
   if (name === "navigate") {
-    const tab = await resolveTab(args.tabId);
+    let tab;
+    try {
+      tab = await resolveTab(args.tabId);
+    } catch (error) {
+      // "No tab with given id" is routine: the user closed it, or Chrome
+      // restarted. Distinguish it from an extension fault, and optionally
+      // replace the tab rather than making the caller unwind its whole plan.
+      if (!args.recreateIfGone || !args.url) {
+        return toolError(`tab ${args.tabId} no longer exists`, { code: "TAB_GONE", tabId: args.tabId });
+      }
+      const fresh = await chrome.tabs.create({ url: "about:blank", active: false });
+      await groupAgentTab(fresh.id, args.groupTitle);
+      tab = fresh;
+    }
     if (args.direction === "back") {
       await chrome.tabs.goBack(tab.id);
       await waitForTabLoad(tab.id, 10000);
@@ -734,11 +1072,17 @@ async function executeTool(name, args) {
       return contentResult({ navigated: true, direction: "forward", tabId: tab.id });
     }
     if (!args.url) throw new Error("url is required");
+    const throttled = await throttleDomain(args.url, args.minIntervalMsPerDomain);
     const wait = waitForTabLoad(tab.id, Number(args.timeoutMs || 30000));
     await chrome.tabs.update(tab.id, { url: args.url });
     await wait;
     const next = await chrome.tabs.get(tab.id);
-    return contentResult({ navigated: true, tabId: tab.id, url: next.url, title: next.title });
+    let state = null;
+    try {
+      const probe = await sendToContent(tab.id, { type: "atria.pageState" });
+      if (probe?.ok) state = probe.state;
+    } catch (_) {}
+    return contentResult({ navigated: true, tabId: tab.id, url: next.url, title: next.title, throttledMs: throttled, pageState: state });
   }
 
   if (name === "read_page") {
@@ -747,11 +1091,15 @@ async function executeTool(name, args) {
       type: "atria.readPage",
       options: {
         filter: args.filter || "all",
-        depth: args.depth || 15,
+        // Pass depth through only when the caller set one. Defaulting here as
+        // well would pin the value and silently override the content script's
+        // own default, which is where the real limit is decided.
+        depth: args.depth,
         maxChars: args.maxChars || args.max_chars || 50000
       }
     });
     if (!result?.ok) return toolError(result?.message || "read_page failed", result);
+    const state = result.result.pageState;
     return {
       content: [
         {
@@ -759,9 +1107,13 @@ async function executeTool(name, args) {
           text: [
             `URL: ${result.result.url}`,
             `Title: ${result.result.title}`,
+            state?.challenge ? `Challenge: ${state.challenge} — this is a bot check, not the page content` : null,
+            `Refs: ${result.result.entries.length}${result.result.truncated ? " (tree truncated)" : ""}`,
             "",
             result.result.tree
-          ].join("\n")
+          ]
+            .filter((line) => line !== null)
+            .join("\n")
         }
       ]
     };
@@ -790,7 +1142,7 @@ async function executeTool(name, args) {
     const tab = await resolveTab(args.tabId);
     const result = await sendToContent(tab.id, { type: "atria.formInput", ref: args.ref, value: args.value });
     if (!result?.ok) return toolError(result?.message || "form_input failed", result);
-    return contentResult({ filled: true, ref: args.ref, matches_n: result.matches_n, match_level: result.match_level });
+    return contentResult({ filled: true, verified: true, ref: args.ref, length: result.length, checked: result.checked });
   }
 
   if (name === "file_upload") {
@@ -816,30 +1168,56 @@ async function executeTool(name, args) {
     const action = args.action;
     await setIndicator(tab.id, true);
     try {
-      if (action === "screenshot") return await captureScreenshot(tab);
+      if (action === "screenshot") return await captureScreenshot(tab, args);
       if (action === "wait") {
         await sleep(Math.min(Number(args.duration || args.durationMs || 1000), 10000));
         return contentResult({ waited: true });
       }
       if (action === "left_click" || action === "right_click" || action === "double_click") {
+        let coordinate = args.coordinate;
+        // A ref is resolved to live viewport coordinates and then clicked over
+        // CDP, same as a coordinate click. Dispatching el.click() here instead
+        // would make the ref path silently weaker than the coordinate path:
+        // canvas tiles, drag surfaces and many custom widgets ignore synthetic
+        // events entirely. Resolving on every call also means stale coordinates
+        // cannot be reused across a relayout.
         if (args.ref) {
-          const result = await sendToContent(tab.id, { type: "atria.clickRef", ref: args.ref });
-          if (!result?.ok) return toolError(result?.message || "click failed", result);
-          await sleep(800);
-          return contentResult({ clicked: true, ref: args.ref, matches_n: result.matches_n, match_level: result.match_level });
+          const spot = await sendToContent(tab.id, { type: "atria.refRect", ref: args.ref });
+          if (!spot?.ok) return toolError(spot?.message || "click failed", spot);
+          if (spot.covered) {
+            return toolError(
+              `${args.ref} is covered by <${spot.hit}> at (${spot.x}, ${spot.y}) — a real click would hit that instead. Dismiss the overlay first.`,
+              spot
+            );
+          }
+          coordinate = { x: spot.x, y: spot.y };
         }
-        await clickAt(tab.id, args.coordinate, action === "right_click" ? "right" : "left", action === "double_click" ? 2 : 1);
+        await clickAt(tab.id, coordinate, action === "right_click" ? "right" : "left", action === "double_click" ? 2 : 1);
         await sleep(800);
-        return contentResult({ clicked: true, coordinate: args.coordinate });
+        return contentResult({ clicked: true, ...(args.ref ? { ref: args.ref } : {}), coordinate });
       }
       if (action === "type") {
+        const text = args.text || "";
         if (args.ref) {
-          const result = await sendToContent(tab.id, { type: "atria.formInput", ref: args.ref, value: args.text || "" });
-          if (!result?.ok) return toolError(result?.message || "type failed", result);
-          return contentResult({ typed: true, ref: args.ref, matches_n: result.matches_n, match_level: result.match_level });
+          const spot = await sendToContent(tab.id, { type: "atria.refRect", ref: args.ref });
+          if (!spot?.ok) return toolError(spot?.message || "type failed", spot);
+          await clickAt(tab.id, { x: spot.x, y: spot.y });
+          await sleep(150);
         }
-        await typeText(tab.id, args.text || "");
-        return contentResult({ typed: true });
+        await typeText(tab.id, text);
+        if (!args.ref) return contentResult({ typed: true });
+        // Typing is only believable once the field reads back. Real key events
+        // append rather than replace, so the check is containment, not equality.
+        await sleep(150);
+        const check = await sendToContent(tab.id, { type: "atria.readValue", ref: args.ref });
+        const actual = check?.ok ? check.value : "";
+        if (text && !actual.includes(text)) {
+          return toolError(
+            `typed into ${args.ref} but it reads back without the text (${actual.length} chars present). The field may have rejected the input or moved focus.`,
+            { typed: false, ref: args.ref, verified: false, actual: actual.slice(0, 200) }
+          );
+        }
+        return contentResult({ typed: true, ref: args.ref, verified: true, length: actual.length });
       }
       if (action === "key") {
         await pressKey(tab.id, args.text || args.key || "Enter");
@@ -865,18 +1243,252 @@ async function executeTool(name, args) {
     }
   }
 
-  if (name === "browser_batch") {
-    const outputs = [];
-    const actions = Array.isArray(args.actions) ? args.actions : [];
-    for (const item of actions) {
-      const result = await executeTool(item.name, item.input || item.arguments || {});
-      outputs.push({ name: item.name, result });
-      if (result?.isError) break;
+  if (name === "export_session") {
+    const stored = await chrome.storage.local.get("atriaAllowSessionExport");
+    if (!stored.atriaAllowSessionExport) {
+      return toolError(
+        "Session export is off. It hands out the site's login credentials in cleartext, so it stays behind an explicit switch: open the Atria extension popup and enable “允许导出登录态”.",
+        { code: "PERMISSION_DENIED" }
+      );
     }
-    return contentResult(outputs);
+    let origin = args.origin;
+    let tab = null;
+    if (!origin) {
+      tab = await resolveTab(args.tabId);
+      try {
+        origin = new URL(tab.url).origin;
+      } catch (_) {
+        return toolError("cannot determine an origin from the tab; pass origin explicitly", { code: "BAD_ARGS" });
+      }
+    }
+    const cookies = await chrome.cookies.getAll({ url: origin });
+    const userAgent = await withDebugger((tab || (await resolveTab(args.tabId))).id, async (cdp) => {
+      const result = await cdp("Runtime.evaluate", { expression: "navigator.userAgent", returnByValue: true });
+      return result?.result?.value || "";
+    });
+    return contentResult({
+      origin,
+      userAgent,
+      cookieCount: cookies.length,
+      cookieHeader: cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; "),
+      cookies: cookies.map((cookie) => ({
+        name: cookie.name,
+        value: cookie.value,
+        domain: cookie.domain,
+        path: cookie.path,
+        secure: cookie.secure,
+        httpOnly: cookie.httpOnly,
+        expirationDate: cookie.expirationDate
+      }))
+    });
+  }
+
+  if (name === "save_as_pdf") {
+    const tab = await resolveTab(args.tabId);
+    const result = await withDebugger(tab.id, async (cdp) => {
+      await cdp("Page.enable");
+      return cdp("Page.printToPDF", {
+        landscape: Boolean(args.landscape),
+        printBackground: args.printBackground !== false,
+        scale: Math.min(Math.max(Number(args.scale || 1), 0.1), 2),
+        paperWidth: PAPER_SIZES[String(args.paperFormat || "letter").toLowerCase()]?.[0] || 8.5,
+        paperHeight: PAPER_SIZES[String(args.paperFormat || "letter").toLowerCase()]?.[1] || 11
+      });
+    });
+    if (!result?.data) return toolError("printToPDF returned no data", { code: "CDP_ERROR" });
+    return {
+      content: [
+        { type: "text", text: JSON.stringify({ pdfBase64: result.data, tabId: tab.id, pageTitle: tab.title }) }
+      ]
+    };
+  }
+
+  if (name === "wait_for") {
+    const tab = await resolveTab(args.tabId);
+    const timeoutMs = Math.max(1000, Math.min(Number(args.timeoutMs || 30000), 900000));
+    const pollMs = Math.max(200, Math.min(Number(args.pollMs || 1000), 10000));
+    const condition = {
+      text: args.text,
+      selector: args.selector,
+      urlRegex: args.urlRegex,
+      gone: Boolean(args.gone),
+      challengeGone: Boolean(args.challengeGone)
+    };
+    const deadline = Date.now() + timeoutMs;
+    let last = null;
+    while (Date.now() < deadline) {
+      try {
+        last = await sendToContent(tab.id, { type: "atria.checkCondition", condition });
+        if (last?.error) return toolError(last.error, { code: "BAD_ARGS" });
+        if (last?.met) {
+          return contentResult({ ok: true, waitedMs: timeoutMs - (deadline - Date.now()), state: last.state });
+        }
+      } catch (error) {
+        // A navigation tears the content script down mid-poll; that is expected
+        // while waiting for a page to change, so keep polling until the deadline.
+        last = { state: { error: error?.message || String(error) } };
+      }
+      await sleep(pollMs);
+    }
+    return toolError(`wait_for timed out after ${timeoutMs}ms`, { code: "TIMEOUT", ok: false, reason: "timeout", state: last?.state || null });
+  }
+
+  if (name === "cdp_tool") {
+    const tab = await resolveTab(args.tabId);
+    const method = String(args.method || "");
+    if (!method) return toolError("method is required", { code: "BAD_ARGS" });
+    if (CDP_DENIED.test(method)) {
+      return toolError(`CDP method refused: ${method}. This bridge drives pages, not the browser process.`, { code: "CDP_REFUSED" });
+    }
+    // Reuse a persistent session when one exists so capture and blocking are not
+    // torn down by a one-shot call attaching and detaching underneath them.
+    if (cdpSessions.has(tab.id)) {
+      const result = await cdpSend(tab.id, method, args.params || {});
+      return contentResult({ method, result });
+    }
+    const result = await withDebugger(tab.id, (cdp) => cdp(method, args.params || {}));
+    return contentResult({ method, result });
+  }
+
+  if (name === "network_start") {
+    const tab = await resolveTab(args.tabId);
+    const session = await attachPersistent(tab.id, "network");
+    session.network = { records: [], truncated: false, filter: args.filter || null };
+    await cdpSend(tab.id, "Network.enable", {});
+    return contentResult({ capturing: true, tabId: tab.id, maxRecords: NETWORK_MAX_RECORDS });
+  }
+
+  if (name === "network_stop") {
+    const tab = await resolveTab(args.tabId);
+    const session = cdpSessions.get(tab.id);
+    if (!session?.network) return contentResult({ capturing: false, tabId: tab.id });
+    const captured = session.network.records.length;
+    session.network = null;
+    try {
+      await cdpSend(tab.id, "Network.disable", {});
+    } catch (_) {}
+    await detachPersistent(tab.id, "network");
+    return contentResult({ capturing: false, tabId: tab.id, captured });
+  }
+
+  if (name === "network_list") {
+    const tab = await resolveTab(args.tabId);
+    const capture = cdpSessions.get(tab.id)?.network;
+    if (!capture) return toolError("network capture is not running for this tab; call network_start first", { code: "NOT_CAPTURING" });
+    const filter = args.filter || capture.filter;
+    const rows = capture.records.filter((record) => networkMatches(record, filter));
+    return contentResult({
+      tabId: tab.id,
+      truncated: capture.truncated,
+      total: capture.records.length,
+      matched: rows.length,
+      requests: rows.map((record) => ({
+        requestId: record.requestId,
+        method: record.method,
+        status: record.status,
+        resourceType: record.resourceType,
+        mimeType: record.mimeType,
+        bytes: record.encodedDataLength,
+        failed: record.failed,
+        url: record.url
+      }))
+    });
+  }
+
+  if (name === "network_detail") {
+    const tab = await resolveTab(args.tabId);
+    const capture = cdpSessions.get(tab.id)?.network;
+    if (!capture) return toolError("network capture is not running for this tab; call network_start first", { code: "NOT_CAPTURING" });
+    const record = capture.records.find((item) => item.requestId === args.requestId);
+    if (!record) return toolError(`unknown requestId: ${args.requestId}`, { code: "NOT_FOUND" });
+    const detail = { ...record };
+    if (args.includeBody) {
+      try {
+        const body = await cdpSend(tab.id, "Network.getResponseBody", { requestId: args.requestId });
+        const text = String(body?.body || "");
+        detail.body = text.slice(0, NETWORK_MAX_BODY_BYTES);
+        detail.bodyBase64Encoded = Boolean(body?.base64Encoded);
+        detail.bodyTruncated = text.length > NETWORK_MAX_BODY_BYTES;
+      } catch (error) {
+        detail.bodyError = error?.message || String(error);
+      }
+    }
+    return contentResult(detail);
+  }
+
+  if (name === "set_request_blocking") {
+    const tab = await resolveTab(args.tabId);
+    const resourceTypes = (args.resourceTypes || []).map((item) => String(item).toLowerCase());
+    const urlPatterns = (args.urlPatterns || []).map(
+      (pattern) => new RegExp(String(pattern).replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*"), "i")
+    );
+    if (!resourceTypes.length && !urlPatterns.length) {
+      return toolError("give at least one of resourceTypes or urlPatterns", { code: "BAD_ARGS" });
+    }
+    const session = await attachPersistent(tab.id, "blocking");
+    session.blocking = { resourceTypes, urlPatterns, blocked: 0 };
+    // Fetch.enable pauses every request so the handler can decide. Patterns stay
+    // wide open here because resourceType filtering happens in the handler.
+    await cdpSend(tab.id, "Fetch.enable", { patterns: [{ urlPattern: "*" }] });
+    return contentResult({ blocking: true, tabId: tab.id, resourceTypes, urlPatterns: args.urlPatterns || [] });
+  }
+
+  if (name === "clear_request_blocking") {
+    const tab = await resolveTab(args.tabId);
+    const session = cdpSessions.get(tab.id);
+    if (!session?.blocking) return contentResult({ blocking: false, tabId: tab.id });
+    const blocked = session.blocking.blocked;
+    session.blocking = null;
+    try {
+      await cdpSend(tab.id, "Fetch.disable", {});
+    } catch (_) {}
+    await detachPersistent(tab.id, "blocking");
+    return contentResult({ blocking: false, tabId: tab.id, blocked });
+  }
+
+  if (name === "browser_batch") {
+    return contentResult(await runBatch(args.actions, Boolean(args.continueOnError)));
+  }
+
+  if (name === "browser_parallel") {
+    const batches = Array.isArray(args.batches) ? args.batches : [];
+    if (!batches.length) return toolError("batches is required", { code: "BAD_ARGS" });
+    if (batches.some((batch) => (batch.actions || []).some((step) => step.name === "browser_parallel"))) {
+      return toolError("browser_parallel cannot nest", { code: "BAD_ARGS" });
+    }
+    // Each batch drives its own tab, so they can genuinely run at the same time.
+    // The transport hands the extension one command at a time; fanning out here
+    // rather than at the server keeps the queue untouched.
+    const results = await Promise.all(
+      batches.map(async (batch, index) => {
+        const actions = (batch.actions || []).map((step) => ({
+          ...step,
+          input: { ...(step.input || step.arguments || {}), ...(batch.tabId !== undefined ? { tabId: batch.tabId } : {}) }
+        }));
+        try {
+          return { index, tabId: batch.tabId, ok: true, steps: await runBatch(actions, batch.continueOnError !== false) };
+        } catch (error) {
+          return { index, tabId: batch.tabId, ok: false, error: error?.message || String(error) };
+        }
+      })
+    );
+    return contentResult({ batches: results });
   }
 
   return toolError(`Tool not implemented in extension: ${name}`);
+}
+
+async function runBatch(actions, continueOnError) {
+  const outputs = [];
+  for (const item of Array.isArray(actions) ? actions : []) {
+    const result = await executeTool(item.name, item.input || item.arguments || {});
+    const failed = Boolean(result?.isError);
+    outputs.push({ name: item.name, ok: !failed, result });
+    // Crawling a list of pages should not lose pages 4 and 5 because page 3
+    // hit a dead link, so the caller decides whether a failure ends the run.
+    if (failed && !continueOnError) break;
+  }
+  return outputs;
 }
 
 async function handleEnvelope(envelope) {
@@ -891,7 +1503,7 @@ async function handleEnvelope(envelope) {
 async function pollOnce() {
   const clientId = await getClientId();
   const base = await bridgeBase("http");
-  const response = await fetch(`${base}/extension/next?clientId=${encodeURIComponent(clientId)}&version=${encodeURIComponent(EXTENSION_VERSION)}`, {
+  const response = await fetch(`${base}/extension/next?clientId=${encodeURIComponent(clientId)}&version=${encodeURIComponent(EXTENSION_VERSION)}&protocol=${PROTOCOL_VERSION}`, {
     cache: "no-store"
   });
   if (response.status === 204) return;

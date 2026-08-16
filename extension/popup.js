@@ -6,6 +6,8 @@ const extensionId = document.getElementById("extension-id");
 const tabStatus = document.getElementById("tab-status");
 const pingButton = document.getElementById("ping");
 const portInput = document.getElementById("bridge-port");
+const sessionExportToggle = document.getElementById("allow-session-export");
+const SESSION_EXPORT_KEY = "atriaAllowSessionExport";
 
 extensionId.textContent = chrome.runtime.id;
 
@@ -59,7 +61,14 @@ async function refresh() {
   const tab = tabs[0];
   tabStatus.textContent = tab ? String(tab.id) : "无";
   tabStatus.className = tab ? "status ok" : "status";
+
+  const stored = await chrome.storage.local.get(SESSION_EXPORT_KEY);
+  sessionExportToggle.checked = Boolean(stored[SESSION_EXPORT_KEY]);
 }
+
+sessionExportToggle.addEventListener("change", async () => {
+  await chrome.storage.local.set({ [SESSION_EXPORT_KEY]: sessionExportToggle.checked });
+});
 
 pingButton.addEventListener("click", refresh);
 portInput.addEventListener("change", async () => {

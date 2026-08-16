@@ -53,6 +53,12 @@
         color: #17211b;
         font: inherit;
       }
+      .hint {
+        margin: 6px 0 0;
+        color: #5b6b60;
+        font-size: 11px;
+        line-height: 1.5;
+      }
       button {
         width: 100%;
         margin-top: 12px;
@@ -84,6 +90,15 @@
       <span>Bridge 端口</span>
       <input id="bridge-port" inputmode="numeric" pattern="[0-9]*" aria-label="Bridge 端口">
     </div>
+    <div class="row">
+      <span>允许导出登录态</span>
+      <input id="allow-session-export" type="checkbox" aria-label="允许导出登录态">
+    </div>
+    <p class="hint">
+      开启后，agent 可以通过 <code>export_session</code> 读取指定域名的 cookie
+      并交给 HTTP 客户端批量抓取。这等于把该网站的登录凭据明文交出去，
+      用完请关掉。默认关闭。
+    </p>
     <button id="ping">重新检测</button>
     <script src="popup.js"></script>
   </body>
