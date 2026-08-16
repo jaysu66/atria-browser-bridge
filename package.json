@@ -9,7 +9,9 @@
   "main": "mcp-server.js",
   "scripts": {
     "start": "node mcp-server.js --standalone",
-    "smoke": "node scripts/smoke-mcp.js"
+    "smoke": "node scripts/smoke-mcp.js",
+    "accept": "node scripts/acceptance.js",
+    "fixtures": "node scripts/serve-fixtures.js"
   },
   "keywords": [
     "mcp",

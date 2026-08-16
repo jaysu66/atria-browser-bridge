@@ -131,6 +131,7 @@ Use `browser_batch` to collapse a known-good sequence into one round trip, and `
 
 ## Known limitations
 
+- **The extension runs one bridge command at a time.** A long `wait_for` blocks every other call until it returns, so you cannot poll or act through the bridge while waiting. That is fine for its purpose — the user clears a bot check in the browser, not through you — but do not expect to run anything alongside it. `browser_parallel` sidesteps this only because its fan-out happens inside a single command.
 - **Screenshots of a background tab go through CDP, which is slower** than the visible-tab path and needs the debugger to attach. Correct, just not instant.
 - **`items[]` detection is a heuristic.** It picks the largest group of similarly-shaped siblings. On a page with several comparable grids it may pick the wrong one — pass `scopeSelector` when the answer matters.
 - **Cross-origin iframes are out of reach.** `read_page`, `find`, `form_input` and `javascript_tool` operate on the top frame. Navigate to the iframe's URL directly instead.
