@@ -219,6 +219,28 @@ function nextEnvelope() {
   });
 }
 
+// Different Chrome paths and CDP versions label image payloads differently
+// (mimeType / mediaType / media_type, sometimes nested under source). Callers
+// should not have to know which one produced a screenshot, so normalize to one
+// shape here. An empty payload becomes a text note rather than an image block
+// no client can render.
+function normalizeImageBlock(block) {
+  if (!block || block.type !== 'image') return block;
+  const source = block.source && typeof block.source === 'object' ? block.source : null;
+  const mimeType =
+    block.mimeType || block.mediaType || block.media_type ||
+    source?.mimeType || source?.mediaType || source?.media_type || 'image/jpeg';
+  const data = typeof block.data === 'string' ? block.data : typeof source?.data === 'string' ? source.data : '';
+  if (!data.trim()) return { type: 'text', text: '[browser screenshot omitted: invalid image data]' };
+  const { media_type, mediaType, source: _source, ...rest } = block;
+  return { ...rest, type: 'image', mimeType, data };
+}
+
+function normalizeContentBlocks(result) {
+  if (!result || typeof result !== 'object' || !Array.isArray(result.content)) return result;
+  return { ...result, content: result.content.map(normalizeImageBlock) };
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -278,7 +300,7 @@ const server = http.createServer(async (req, res) => {
       }
       pendingResults.delete(body.id);
       clearTimeout(entry.timer);
-      entry.resolve(body.result);
+      entry.resolve(normalizeContentBlocks(body.result));
       jsonResponse(res, 200, { ok: true });
       return;
     }
