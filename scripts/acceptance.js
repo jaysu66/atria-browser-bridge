@@ -207,6 +207,53 @@ async function main() {
     });
     check('click_where locates by predicate and clicks for real', !clicked.result.isError, text(clicked));
 
+    // A thrown error and a genuine null must not look the same.
+    const thrown = await call('javascript_tool', { tabId: listing.id, text: 'JSON.parse("{oops")' });
+    const nulled = await call('javascript_tool', { tabId: listing.id, text: 'null' });
+    check(
+      'javascript_tool separates a throw from a real null',
+      thrown.result.isError && text(thrown).includes('PAGE_ERROR') && !nulled.result.isError && text(nulled).includes('"result": null'),
+      `throw=${text(thrown).slice(0, 60)} null=${text(nulled)}`
+    );
+
+    // Overlay-style scoping: read one subtree instead of a truncated whole page.
+    const subtree = text(await call('read_page', { tabId: listing.id, filter: 'interactive', rootSelector: 'nav.pagination' }));
+    const missing = await call('read_page', { tabId: listing.id, rootSelector: '#does-not-exist' });
+    check(
+      'read_page rootSelector scopes to a subtree and reports a miss',
+      subtree.includes('Scoped to: nav.pagination') && (subtree.match(/\[ref_\d+\]/g) || []).length === 2 && missing.result.isError,
+      `refs=${(subtree.match(/\[ref_\d+\]/g) || []).length}, miss reported=${missing.result.isError}`
+    );
+
+    // act_until closes locate/act/verify, and untilGone drives the other way.
+    const toggled = await call('computer', {
+      tabId: virtual.id, action: 'act_until',
+      selector: '.tile', predicateJs: 'el => el.dataset.tile === "5"',
+      until: { js: '() => document.querySelector(\'[data-tile="5"]\').dataset.hit === "1"' },
+      maxAttempts: 3, settleMs: 400,
+    });
+    // Nothing sets data-hit, so this must fail cleanly rather than claim success.
+    check(
+      'act_until fails honestly when its condition never holds',
+      toggled.result.isError && text(toggled).includes('NOT_SATISFIED') && text(toggled).includes('"attempts": 3'),
+      text(toggled).slice(0, 110)
+    );
+
+    const parallel = json(await call('browser_parallel', {
+      batches: [
+        { tabId: listing.id, actions: [{ name: 'get_page_text', input: { maxChars: 60 } }] },
+        { tabId: virtual.id, actions: [{ name: 'get_page_text', input: { maxChars: 60 } }] },
+      ],
+    }));
+    check('browser_parallel runs one batch per tab', (parallel?.batches || []).every((b) => b.ok), JSON.stringify((parallel?.batches || []).map((b) => b.ok)));
+
+    const pdf = json(await call('save_as_pdf', { tabId: listing.id, paperFormat: 'a4' }));
+    const isPdf = Boolean(pdf?.pdfBase64) && Buffer.from(pdf.pdfBase64.slice(0, 12), 'base64').toString('latin1').startsWith('%PDF');
+    check('save_as_pdf produces a real PDF', isPdf, `${pdf?.pdfBase64?.length || 0} base64 chars`);
+
+    const activated = await call('tabs_activate', { tabId: listing.id });
+    check('tabs_activate brings a tab forward', !activated.result.isError && text(activated).includes('"activated": true'), text(activated).slice(0, 80));
+
     const evaluated = json(await call('cdp_tool', { tabId: listing.id, method: 'Runtime.evaluate', params: { expression: '1+1', returnByValue: true } }));
     const refused = await call('cdp_tool', { tabId: listing.id, method: 'Browser.close' });
     check('cdp_tool works and refuses browser-process methods', evaluated?.result?.result?.value === 2 && refused.result.isError, 'Runtime.evaluate ok, Browser.close refused');
