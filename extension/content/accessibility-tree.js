@@ -34,17 +34,12 @@
     if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") return false;
     const type = (el.getAttribute("type") || "").toLowerCase();
     if (type === "password" || type === "hidden") return true;
-    const autocomplete = (el.getAttribute("autocomplete") || "").toLowerCase();
-    return [
-      "current-password",
-      "new-password",
-      "one-time-code",
-      "cc-number",
-      "cc-csc",
-      "cc-exp",
-      "cc-exp-month",
-      "cc-exp-year"
-    ].some((key) => autocomplete.includes(key));
+    // Mirror the sensitive() check extract_page uses in service-worker.js. OTP
+    // and card inputs are usually plain text fields carrying no autocomplete
+    // hint, so name and id have to count too — matching on autocomplete alone
+    // let read_page hand back values that extract_page redacts.
+    const hints = `${el.getAttribute("name") || ""} ${el.getAttribute("id") || ""} ${el.getAttribute("autocomplete") || ""}`.toLowerCase();
+    return /(password|token|secret|otp|one-time|cc-|credit|card|cvv|cvc)/.test(hints);
   }
 
   function isVisible(el) {
@@ -82,7 +77,6 @@
   }
 
   function labelFor(el) {
-    if (isSensitive(el)) return el.value ? "[value redacted]" : "";
     const aria = el.getAttribute("aria-label");
     if (aria) return aria.trim();
     const labelledBy = el.getAttribute("aria-labelledby");
@@ -101,7 +95,13 @@
     const parentLabel = el.closest("label");
     if (parentLabel && parentLabel.textContent.trim()) return parentLabel.textContent.trim();
     if ("placeholder" in el && el.placeholder) return el.placeholder.trim();
-    if ("value" in el && typeof el.value === "string" && el.value && el.tagName !== "BUTTON") return el.value.trim();
+    // The value doubles as the last-resort label, so this is the only path that
+    // can put a field's contents in the tree. Redact here rather than bailing
+    // out at the top of labelFor, so a sensitive field keeps a usable label
+    // (aria-label, wrapping <label>, placeholder) and stays findable.
+    if ("value" in el && typeof el.value === "string" && el.value && el.tagName !== "BUTTON") {
+      return isSensitive(el) ? "[value redacted]" : el.value.trim();
+    }
     if (el.getAttribute("alt")) return el.getAttribute("alt").trim();
     if (el.getAttribute("title")) return el.getAttribute("title").trim();
     return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();

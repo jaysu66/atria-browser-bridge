@@ -47,7 +47,7 @@
       <form id="fixture-form">
         <label>
           用户名
-          <input name="username" autocomplete="username" placeholder="输入用户名">
+          <input name="username" autocomplete="username" placeholder="输入用户名" value="zhangsan">
         </label>
         <label>
           密码
@@ -56,6 +56,24 @@
         <label>
           信用卡号
           <input name="card" autocomplete="cc-number" value="4242424242424242">
+        </label>
+        <!-- 以下四个是真实世界里最常见的形态：普通 text 输入框，没有任何
+             autocomplete 提示，只能靠 name/id 判断敏感。 -->
+        <label>
+          短信验证码
+          <input name="otp" inputmode="numeric" value="884213">
+        </label>
+        <label>
+          安全码
+          <input name="cvv" value="311">
+        </label>
+        <label>
+          接口密钥
+          <input id="api_token" value="sk-live-9f3a2b7c4d1e8055">
+        </label>
+        <label>
+          旧密码（非 password 类型）
+          <input name="old_password" value="hunter2-legacy">
         </label>
         <label>
           城市

@@ -635,14 +635,23 @@ async function extractPage(tab, args) {
 async function captureScreenshot(tab) {
   let data = "";
   let method = "tabs.captureVisibleTab";
-  try {
-    const dataUrl = await withTimeout(
-      chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 70 }),
-      5000,
-      "tabs.captureVisibleTab timeout"
-    );
-    [, data = ""] = dataUrl.split(",");
-  } catch (_) {
+  // captureVisibleTab only takes a windowId, so it grabs whatever tab is visible
+  // there and ignores tab.id. On a background tab that returns a picture of the
+  // page the user is actually looking at. Restrict it to the active tab and let
+  // CDP handle the rest, since Page.captureScreenshot targets the tab directly.
+  if (tab.active) {
+    try {
+      const dataUrl = await withTimeout(
+        chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 70 }),
+        5000,
+        "tabs.captureVisibleTab timeout"
+      );
+      [, data = ""] = dataUrl.split(",");
+    } catch (_) {
+      data = "";
+    }
+  }
+  if (!data) {
     method = "debugger.Page.captureScreenshot";
     try {
       const result = await withTimeout(
