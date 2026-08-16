@@ -93,22 +93,52 @@ args = ["/absolute/path/to/atria-browser-bridge/mcp-server.js"]
 
 ## Tools
 
+**Tabs and navigation**
+
 | Tool | What it does |
 | --- | --- |
-| `browser_status` | Health of the MCP server, local bridge, and extension connection. |
-| `tabs_context` | List Chrome tabs and the agent's tab group. |
-| `tabs_create` | Open a new tab (auto-grouped under the agent's tab group). |
+| `browser_status` | Health of the MCP server, local bridge, extension connection, and protocol versions. |
+| `tabs_context` | List Chrome tabs and every agent tab group. |
+| `tabs_create` | Open a tab, grouped under a task-named tab group. |
+| `tabs_activate` | Bring a tab to the front and focus its window. |
 | `tabs_close` | Close a tab. |
-| `navigate` | Navigate / back / forward. |
-| `read_page` | Read the accessibility tree and return stable element `ref`s. |
-| `get_page_text` | Read visible page text — fast way to check page state. |
-| `extract_page` | Structured extraction: meta, text, links, images, media, forms, tables, JSON-LD, resources. |
-| `find` | Find elements by text / natural-language query. |
-| `form_input` | Set values on inputs, textareas, selects, contenteditable — by `ref`. |
-| `file_upload` | Attach local files to a file input (via Chrome DevTools Protocol). |
-| `computer` | Click, right-click, double-click, keyboard, scroll, wait, screenshot. |
-| `javascript_tool` | Run JS in the page main world for precise probing / location. |
-| `browser_batch` | Run several browser tools in sequence, stopping on error. |
+| `navigate` | Navigate / back / forward, with optional per-domain throttling and tab self-heal. |
+
+**Reading**
+
+| Tool | What it does |
+| --- | --- |
+| `read_page` | Accessibility tree with stable element `ref`s. |
+| `get_page_text` | Visible page text — fast way to check page state. |
+| `extract_page` | Structured extraction: meta, text, links, images, media, forms, tables, JSON-LD, resources, detected listing `items[]` and `pagination.next`. Scopeable to a container; incremental mode for infinite scroll. |
+| `find` | Find elements by text query. |
+
+**Acting** — clicks and keystrokes are real CDP input, so they carry `isTrusted=true`.
+
+| Tool | What it does |
+| --- | --- |
+| `computer` | Click, right-click, double-click, type, key, scroll, wait, screenshot (croppable to an element). |
+| `form_input` | Set a field by `ref`, verified by reading back. |
+| `file_upload` | Attach local files to a file input. |
+| `wait_for` | Block until text / selector / URL matches, or until a bot check clears. |
+| `javascript_tool` | Run JS in the page main world for probing. |
+
+**Crawling**
+
+| Tool | What it does |
+| --- | --- |
+| `network_start` / `network_stop` / `network_list` / `network_detail` | Record requests and read response bodies — read the JSON API directly instead of parsing HTML. |
+| `set_request_blocking` / `clear_request_blocking` | Drop images, fonts, media and tracker URLs. |
+| `browser_batch` | Run tools in sequence in one round trip, optionally continuing past errors. |
+| `browser_parallel` | Run one batch per tab, concurrently. |
+| `export_session` | Cookies + UA for an origin, for bulk HTTP fetching. Off until enabled in the popup. |
+
+**Escape hatches**
+
+| Tool | What it does |
+| --- | --- |
+| `cdp_tool` | Raw Chrome DevTools Protocol passthrough. |
+| `save_as_pdf` | Render the page to PDF. |
 
 ## Standalone HTTP mode
 
@@ -144,6 +174,21 @@ node scripts/smoke-mcp.js
 # MCP smoke ok: 14 tools, server=atria-browser-bridge@0.1.0
 # HTTP health ok: atria-browser-bridge
 ```
+
+## Use it as a Claude Code / Kimi CLI skill
+
+If your agent supports skills, `skills/atria-browser-bridge/` is a drop-in that
+needs no MCP registration. Copy it into the harness's skill directory:
+
+```bash
+cp -r skills/atria-browser-bridge ~/.claude/skills/          # Claude Code
+cp -r skills/atria-browser-bridge ~/.kimi-code/skills/       # Kimi CLI
+```
+
+It ships a helper script that starts the bridge on demand, writes screenshots
+and PDFs to disk (a model cannot read a base64 blob), and keeps stdout clean
+JSON so a driver script can pipe it straight into a parser. See
+[docs/使用指南.md](docs/使用指南.md) for the full walkthrough.
 
 ## Roadmap
 
