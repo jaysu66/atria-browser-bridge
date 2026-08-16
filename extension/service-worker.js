@@ -1,4 +1,4 @@
-const DEFAULT_BRIDGE_PORT = 47652;
+﻿const DEFAULT_BRIDGE_PORT = 47652;
 const BRIDGE_PORT_KEY = "atriaBridgePort";
 const EXTENSION_VERSION = chrome.runtime.getManifest().version;
 const AGENT_GROUP_TITLE = "Atria Agent";
@@ -590,6 +590,8 @@ async function autoScrollPage(tabId, steps) {
   });
 }
 
+const seenItems = new Map();
+
 async function extractPage(tab, args) {
   if (args.autoScroll !== false) {
     await autoScrollPage(tab.id, args.scrollSteps || 8);
@@ -645,6 +647,67 @@ async function extractPage(tab, args) {
         return trim(el.value, 300);
       };
       const limited = (items) => items.slice(0, maxItems);
+      // Scoping to a container is what makes list-page extraction affordable:
+      // the surrounding chrome is usually most of the text and none of the data.
+      // Page-level facts (meta, JSON-LD, resources) stay document-wide.
+      const scopeEl = options.scopeSelector ? document.querySelector(options.scopeSelector) : null;
+      const root = scopeEl || document.body || document.documentElement;
+      const scoped = (selector) => Array.from(root.querySelectorAll(selector));
+      // Pagination: rel=next is authoritative; otherwise fall back to link text.
+      const NEXT_TEXT = /^(next|next page|older|more|下一页|下页|下一頁|次へ|»|›|>)$/i;
+      const paginationOf = () => {
+        const rel = document.querySelector("link[rel=next], a[rel=next]");
+        if (rel) return { next: absUrl(rel.getAttribute("href")), source: "rel=next" };
+        const anchors = scoped("a[href]").concat(Array.from(document.querySelectorAll("nav a[href], .pagination a[href]")));
+        const hit = anchors.find(
+          (a) => NEXT_TEXT.test(clean(a.innerText)) || NEXT_TEXT.test(clean(a.getAttribute("aria-label")))
+        );
+        return hit ? { next: absUrl(hit.getAttribute("href")), source: "text" } : { next: null, source: null };
+      };
+
+      // A listing is N sibling nodes that share a shape. Grouping siblings by
+      // tag plus leading class names finds the card container without needing a
+      // per-site selector, which is what makes this reusable across platforms.
+      const itemsOf = () => {
+        const byParent = new Map();
+        for (const el of scoped("*")) {
+          const parent = el.parentElement;
+          if (!parent) continue;
+          let signatures = byParent.get(parent);
+          if (!signatures) {
+            signatures = new Map();
+            byParent.set(parent, signatures);
+          }
+          const cls = typeof el.className === "string" ? el.className.trim().split(/\s+/).slice(0, 2).join(".") : "";
+          const signature = `${el.tagName}.${cls}`;
+          if (!signatures.has(signature)) signatures.set(signature, []);
+          signatures.get(signature).push(el);
+        }
+        let best = [];
+        let bestText = 0;
+        for (const signatures of byParent.values()) {
+          for (const list of signatures.values()) {
+            if (list.length < 3) continue;
+            const textLen = list.reduce((sum, el) => sum + (el.innerText || "").length, 0);
+            // Most members wins; ties break on total text so grids of spacer
+            // divs lose to grids of actual cards.
+            if (list.length > best.length || (list.length === best.length && textLen > bestText)) {
+              best = list;
+              bestText = textLen;
+            }
+          }
+        }
+        return limited(
+          best
+            .map((el) => ({
+              text: trim(el.innerText, 500),
+              hrefs: Array.from(el.querySelectorAll("a[href]")).slice(0, 5).map((a) => absUrl(a.getAttribute("href"))),
+              images: Array.from(el.querySelectorAll("img[src]")).slice(0, 3).map((img) => absUrl(img.getAttribute("src")))
+            }))
+            .filter((item) => item.text || item.hrefs.length)
+        );
+      };
+
       const metaTags = {};
       for (const meta of Array.from(document.querySelectorAll("meta"))) {
         const key = meta.getAttribute("name") || meta.getAttribute("property") || meta.getAttribute("http-equiv");
@@ -658,14 +721,14 @@ async function extractPage(tab, args) {
           return { parseError: true, raw: raw.slice(0, 2000) };
         }
       });
-      const headings = limited(Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6")).map((el) => ({
+      const headings = limited(scoped("h1,h2,h3,h4,h5,h6").map((el) => ({
         level: Number(el.tagName.slice(1)),
         text: trim(el.innerText, 500),
         visible: visible(el),
         rect: rectOf(el)
       })).filter((item) => item.text));
-      const paragraphs = limited(Array.from(document.querySelectorAll("p,article li,main li")).map((el) => trim(el.innerText, 1000)).filter((text) => text.length > 20));
-      const links = limited(Array.from(document.querySelectorAll("a[href]")).map((el) => ({
+      const paragraphs = limited(scoped("p,article li,main li").map((el) => trim(el.innerText, 1000)).filter((text) => text.length > 20));
+      const links = limited(scoped("a[href]").map((el) => ({
         text: trim(el.innerText || el.getAttribute("aria-label") || el.getAttribute("title"), 300),
         href: absUrl(el.getAttribute("href")),
         title: el.getAttribute("title") || "",
@@ -674,7 +737,7 @@ async function extractPage(tab, args) {
         visible: visible(el),
         rect: rectOf(el)
       })).filter((item) => item.href));
-      const images = limited(Array.from(document.images).map((img) => ({
+      const images = limited(scoped("img").map((img) => ({
         src: absUrl(img.currentSrc || img.src),
         srcset: img.getAttribute("srcset") || "",
         alt: img.getAttribute("alt") || "",
@@ -685,13 +748,13 @@ async function extractPage(tab, args) {
         visible: visible(img),
         rect: rectOf(img)
       })).filter((item) => item.src));
-      const backgroundImages = limited(Array.from(document.querySelectorAll("body *")).map((el) => {
+      const backgroundImages = limited(scoped("*").map((el) => {
         const bg = getComputedStyle(el).backgroundImage || "";
         const matches = Array.from(bg.matchAll(/url\(["']?([^"')]+)["']?\)/g)).map((match) => absUrl(match[1]));
         if (!matches.length) return null;
         return { urls: matches, text: trim(el.innerText, 160), visible: visible(el), rect: rectOf(el) };
       }).filter(Boolean));
-      const media = limited(Array.from(document.querySelectorAll("video,audio")).map((el) => ({
+      const media = limited(scoped("video,audio").map((el) => ({
         tag: el.tagName.toLowerCase(),
         src: absUrl(el.currentSrc || el.src || ""),
         poster: absUrl(el.getAttribute("poster") || ""),
@@ -706,7 +769,7 @@ async function extractPage(tab, args) {
         visible: visible(el),
         rect: rectOf(el)
       })));
-      const embeds = limited(Array.from(document.querySelectorAll("iframe,embed,object")).map((el) => ({
+      const embeds = limited(scoped("iframe,embed,object").map((el) => ({
         tag: el.tagName.toLowerCase(),
         src: absUrl(el.getAttribute("src") || el.getAttribute("data") || ""),
         title: el.getAttribute("title") || el.getAttribute("aria-label") || "",
@@ -714,7 +777,7 @@ async function extractPage(tab, args) {
         visible: visible(el),
         rect: rectOf(el)
       })));
-      const forms = limited(Array.from(document.forms).map((form) => ({
+      const forms = limited(scoped("form").map((form) => ({
         id: form.id || "",
         name: form.getAttribute("name") || "",
         action: absUrl(form.getAttribute("action") || location.href),
@@ -734,11 +797,11 @@ async function extractPage(tab, args) {
           rect: rectOf(el)
         }))
       })));
-      const tables = limited(Array.from(document.querySelectorAll("table")).map((table) => {
+      const tables = limited(scoped("table").map((table) => {
         const rows = Array.from(table.rows).slice(0, 50).map((row) => Array.from(row.cells).slice(0, 20).map((cell) => trim(cell.innerText, 300)));
         return { caption: trim(table.caption?.innerText || "", 300), rows, visible: visible(table), rect: rectOf(table) };
       }));
-      const interactive = limited(Array.from(document.querySelectorAll("a[href],button,input,select,textarea,summary,[role='button'],[role='link'],[contenteditable='true']")).map((el) => ({
+      const interactive = limited(scoped("a[href],button,input,select,textarea,summary,[role='button'],[role='link'],[contenteditable='true']").map((el) => ({
         tag: el.tagName.toLowerCase(),
         role: el.getAttribute("role") || "",
         text: trim(el.innerText || el.value || el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.getAttribute("title"), 300),
@@ -754,7 +817,7 @@ async function extractPage(tab, args) {
         transferSize: entry.transferSize || 0,
         encodedBodySize: entry.encodedBodySize || 0
       })));
-      const text = clean(document.body?.innerText || "").slice(0, maxTextChars);
+      const text = clean(root.innerText || "").slice(0, maxTextChars);
       return {
         meta: {
           url: location.href,
@@ -767,6 +830,9 @@ async function extractPage(tab, args) {
           twitter: Object.fromEntries(Object.entries(metaTags).filter(([key]) => key.startsWith("twitter:"))),
           viewport: { width: window.innerWidth, height: window.innerHeight, scrollHeight: document.documentElement.scrollHeight }
         },
+        scope: options.scopeSelector ? { selector: options.scopeSelector, matched: Boolean(scopeEl) } : null,
+        pagination: paginationOf(),
+        items: itemsOf(),
         text: { length: text.length, visibleText: text, headings, paragraphs },
         links,
         images,
@@ -797,9 +863,27 @@ async function extractPage(tab, args) {
       maxItems: args.maxItems,
       maxTextChars: args.maxTextChars || args.max_text_chars,
       includeResources: args.includeResources ?? args.include_resources,
+      scopeSelector: args.scopeSelector || null,
     }]
   });
   const extracted = injection[0]?.result || {};
+
+  // Infinite-scroll pages re-serve everything already seen on each pass, so a
+  // crawler paying per token wants only what is new since the last call. Keyed
+  // per tab and reset whenever the URL changes.
+  if (args.incremental) {
+    const seen = seenItems.get(tab.id);
+    const fresh = seen && seen.url === extracted.url ? seen.keys : new Set();
+    const before = (extracted.items || []).length;
+    extracted.items = (extracted.items || []).filter((item) => {
+      const key = `${item.text}|${item.hrefs.join(",")}`;
+      if (fresh.has(key)) return false;
+      fresh.add(key);
+      return true;
+    });
+    extracted.incremental = { newItems: extracted.items.length, suppressed: before - extracted.items.length };
+    seenItems.set(tab.id, { url: extracted.url, keys: fresh });
+  }
   // Surface the bot-check verdict here too. A crawler that only calls
   // extract_page would otherwise happily "extract" a challenge page.
   try {

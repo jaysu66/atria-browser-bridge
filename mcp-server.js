@@ -407,7 +407,7 @@ const TOOLS = [
   },
   {
     name: 'extract_page',
-    description: 'Extract a structured crawl snapshot from the page: metadata, text sections, links, images, media, forms, tables, embeds, interactive elements, JSON-LD, and loaded resources.',
+    description: 'Extract a structured crawl snapshot: metadata, text sections, links, images, media, forms, tables, embeds, interactive elements, JSON-LD, loaded resources, plus detected listing items and the next-page link. On a list page, set scopeSelector to the card container — the surrounding chrome is usually most of the text and none of the data.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -417,6 +417,8 @@ const TOOLS = [
         includeResources: { type: 'boolean', default: true },
         autoScroll: { type: 'boolean', default: true },
         scrollSteps: { type: 'number', default: 8 },
+        scopeSelector: { type: 'string', description: 'Restrict extraction to this container. Page-level metadata stays document-wide.' },
+        incremental: { type: 'boolean', default: false, description: 'Return only items not seen on previous calls for this tab. For infinite scroll.' },
       },
     },
   },
