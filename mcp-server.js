@@ -197,30 +197,6 @@ function nextEnvelope() {
   });
 }
 
-function sanitizeText(value) {
-  let text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-  if (!text) return '';
-  text = text.replace(/document\.cookie\s*[:=][\s\S]{0,200}/gi, '[BLOCKED: cookie]');
-  text = text.replace(/\b(access_token|refresh_token|id_token|api[_-]?key|password|passwd|secret|token)=([^&\s]+)/gi, '$1=[BLOCKED]');
-  text = text.replace(/\b(authorization|bearer|access_token|refresh_token|id_token|api[_-]?key|secret|token)\b\s*[:=]\s*["']?(Bearer\s+)?[A-Za-z0-9+/_=-]{16,}/gi, '$1=[BLOCKED]');
-  text = text.replace(/\b(sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9_]{20,}|pk_live_[A-Za-z0-9_]{16,})\b/g, '[BLOCKED: api key]');
-  return text;
-}
-
-function sanitizeResult(result) {
-  if (!result || typeof result !== 'object') return result;
-  const clone = JSON.parse(JSON.stringify(result));
-  if (Array.isArray(clone.content)) {
-    clone.content = clone.content.map((block) => {
-      if (block && block.type === 'text' && typeof block.text === 'string') {
-        return { ...block, text: sanitizeText(block.text) };
-      }
-      return block;
-    });
-  }
-  return clone;
-}
-
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -280,7 +256,7 @@ const server = http.createServer(async (req, res) => {
       }
       pendingResults.delete(body.id);
       clearTimeout(entry.timer);
-      entry.resolve(sanitizeResult(body.result));
+      entry.resolve(body.result);
       jsonResponse(res, 200, { ok: true });
       return;
     }
@@ -368,7 +344,7 @@ const TOOLS = [
   },
   {
     name: 'read_page',
-    description: 'Read the current page as an accessibility-style tree with stable refs such as [ref_1]. Sensitive values are redacted.',
+    description: 'Read the current page as an accessibility-style tree with stable refs such as [ref_1]. Returns page content verbatim, including form field values.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -467,7 +443,7 @@ const TOOLS = [
   },
   {
     name: 'javascript_tool',
-    description: 'Evaluate JavaScript in the page main world. Returns are sanitized by the local bridge.',
+    description: 'Evaluate JavaScript in the page main world. Returns are passed through verbatim.',
     inputSchema: {
       type: 'object',
       properties: {

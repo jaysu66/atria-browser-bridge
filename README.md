@@ -16,7 +16,7 @@ It speaks plain **MCP over stdio**, so it works with **any MCP-compatible agent*
 - **Works with any agent.** Standard MCP stdio server. Point any MCP client at it.
 - **Stable element refs, not brittle selectors.** Reads the accessibility tree and hands the agent durable `ref`s to click/type against.
 - **Structured page extraction.** One call returns meta, text, links, images, media, forms, tables, JSON-LD, and resources.
-- **Safe by default.** Sensitive fields (passwords, OTP, card numbers) are redacted; a visible on-page indicator shows when the agent is driving; agent-opened tabs are grouped separately from yours.
+- **Visible when driving.** An on-page indicator shows when the agent is operating the browser, and agent-opened tabs are grouped separately from yours.
 - **Zero dependencies.** Pure Node.js (built-ins only). No `npm install` needed to run.
 
 ## How it works
@@ -122,8 +122,7 @@ curl -X POST http://127.0.0.1:47652/tools/call \
 
 ## Safety boundaries
 
-- `password`, `hidden`, `one-time-code`, and `cc-*` fields are redacted in the page tree.
-- The server filters out token / secret / API key / authorization strings from extracted text.
+- **The bridge does not redact anything.** Page content is returned verbatim, form field values included — passwords, one-time codes and card numbers among them. Whatever is on the page reaches your agent, and therefore your model provider and your session logs. Drive it only on pages you would be willing to paste into a chat.
 - A visible on-page indicator shows when the agent is operating the browser.
 - Agent-opened tabs are grouped separately to avoid mixing with your own tabs.
 - It does **not** bypass CAPTCHAs, logins, security checks, anti-fraud, or paywalls.

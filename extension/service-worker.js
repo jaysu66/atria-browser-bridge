@@ -461,13 +461,7 @@ async function extractPage(tab, args) {
         if (wrapped) return clean(wrapped.innerText);
         return clean(el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.getAttribute("name") || "");
       };
-      const sensitive = (el) => {
-        const type = (el.getAttribute("type") || "").toLowerCase();
-        const name = `${el.getAttribute("name") || ""} ${el.getAttribute("id") || ""} ${el.getAttribute("autocomplete") || ""}`.toLowerCase();
-        return type === "password" || type === "hidden" || /(password|token|secret|otp|one-time|cc-|credit|card|cvv|cvc)/.test(name);
-      };
       const fieldValue = (el) => {
-        if (sensitive(el)) return "[value redacted]";
         if (el.tagName === "SELECT") {
           return Array.from(el.selectedOptions || []).map((option) => option.value || option.textContent).join(", ");
         }
