@@ -193,12 +193,30 @@
   }
 
   function generatePageTree(opts) {
-    state.entries = walk(document.body || document.documentElement, opts || {});
-    const maxChars = Math.max(1000, Math.min(Number(opts?.maxChars || 50000), 200000));
-    let text = state.entries.map((entry) => entry.line).join("\n");
+    const options = opts || {};
+    // A dialog's contents sit at the end of a large app's DOM, so a whole-page
+    // tree hits maxChars and truncates them away — the overlay looks absent
+    // when it is merely last. rootSelector reads just that subtree instead.
+    let root = document.body || document.documentElement;
+    let rootMatched = null;
+    if (options.rootSelector) {
+      const scoped = document.querySelector(options.rootSelector);
+      rootMatched = Boolean(scoped);
+      if (scoped) root = scoped;
+    }
+    state.entries = walk(root, options);
+    const maxChars = Math.max(1000, Math.min(Number(options.maxChars || 50000), 200000));
+    const lines = state.entries.map((entry) => entry.line);
+    let text = lines.join("\n");
     let truncated = false;
+    let droppedLines = 0;
     if (text.length > maxChars) {
-      text = text.slice(0, maxChars) + "\n...[truncated]";
+      // Truncation cuts from the end, which is where dialogs and late-mounted
+      // overlays live. Say how much went missing so it reads as "there is more"
+      // rather than "that was the whole page".
+      const kept = text.slice(0, maxChars);
+      droppedLines = lines.length - kept.split("\n").length;
+      text = `${kept}\n...[truncated: ${droppedLines} more elements. Narrow with rootSelector, or use filter:"interactive"]`;
       truncated = true;
     }
     return {
@@ -207,6 +225,9 @@
       tree: text,
       entries: state.entries.filter((entry) => entry.ref).slice(0, 2000),
       truncated,
+      droppedLines,
+      rootSelector: options.rootSelector || null,
+      rootMatched,
       pageState: pageState()
     };
   }
@@ -383,65 +404,6 @@
     return { met: false, state, error: "no condition given" };
   }
 
-  // Shared by rectForRef and locate: scroll into view, then report the centre
-  // and whether anything is sitting on top of it.
-  function hitPointFor(el) {
-    el.scrollIntoView({ block: "center", inline: "center" });
-    const rect = el.getBoundingClientRect();
-    if (rect.width === 0 && rect.height === 0) {
-      return { ok: false, code: "not_visible", message: "element has no layout box" };
-    }
-    const x = Math.round(rect.left + rect.width / 2);
-    const y = Math.round(rect.top + rect.height / 2);
-    const hit = document.elementFromPoint(x, y);
-    const covered = !hit || !(hit === el || el.contains(hit) || hit.contains(el));
-    return {
-      ok: true,
-      x,
-      y,
-      width: Math.round(rect.width),
-      height: Math.round(rect.height),
-      covered,
-      hit: covered && hit ? hit.tagName.toLowerCase() : null
-    };
-  }
-
-  function locate(selector, predicateJs) {
-    let el = null;
-    if (predicateJs) {
-      // A predicate can express what a selector cannot — "the tile whose src
-      // contains this upload id" — which is exactly the case where no ref
-      // exists to aim at.
-      let test;
-      try {
-        test = eval(`(${predicateJs})`);
-      } catch (error) {
-        return { ok: false, code: "bad_predicate", message: `predicateJs did not compile: ${error.message}` };
-      }
-      const pool = Array.from(document.querySelectorAll(selector || "*"));
-      el = pool.find((candidate) => {
-        try {
-          return test(candidate);
-        } catch (_) {
-          return false;
-        }
-      });
-    } else if (selector) {
-      el = document.querySelector(selector);
-    }
-    if (!el) return { ok: false, code: "not_found", message: `nothing matched ${predicateJs || selector}` };
-    return { ...hitPointFor(el), selector, tag: el.tagName.toLowerCase() };
-  }
-
-  function evaluatePredicate(predicateJs) {
-    try {
-      const fn = eval(`(${predicateJs})`);
-      return { ok: true, value: typeof fn === "function" ? fn() : fn };
-    } catch (error) {
-      return { ok: false, code: "bad_predicate", message: error.message };
-    }
-  }
-
   function readValueByRef(ref) {
     const el = resolveRef(ref);
     if (!el) return { ok: false, code: "not_found", message: `ref not found: ${ref}` };
@@ -483,14 +445,6 @@
       }
       if (message.type === "atria.pageState") {
         sendResponse({ ok: true, state: pageState() });
-        return true;
-      }
-      if (message.type === "atria.locate") {
-        sendResponse(locate(message.selector, message.predicateJs));
-        return true;
-      }
-      if (message.type === "atria.evaluatePredicate") {
-        sendResponse(evaluatePredicate(message.predicateJs));
         return true;
       }
       if (message.type === "atria.viewportCentre") {

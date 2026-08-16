@@ -97,8 +97,13 @@ function markExtension(req) {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   bridgeState.extensionClientId = url.searchParams.get('clientId') || bridgeState.extensionClientId;
   bridgeState.extensionVersion = url.searchParams.get('version') || bridgeState.extensionVersion;
-  // Absent means an extension from before the handshake existed, i.e. protocol 1.
-  bridgeState.protocolVersion = Number(url.searchParams.get('protocol') || 1);
+  // Only record the protocol when the request actually carries one. Not every
+  // endpoint the extension hits sends it — the websocket upgrade does not — and
+  // defaulting on those would overwrite a known-good version with 1 and warn
+  // that a current extension is stale. Absent stays absent; the check below
+  // treats a never-reported version as protocol 1.
+  const reported = url.searchParams.get('protocol');
+  if (reported !== null) bridgeState.protocolVersion = Number(reported);
   bridgeState.lastSeenAt = new Date().toISOString();
 }
 
@@ -414,14 +419,15 @@ const TOOLS = [
   },
   {
     name: 'read_page',
-    description: 'Read the current page as an accessibility-style tree with stable refs such as [ref_1]. Returns page content verbatim, including form field values.',
+    description: 'Read the page as an accessibility-style tree with stable refs such as [ref_1]. Content is verbatim, form values included. If a dialog or popover seems missing, it is usually last in a large DOM and got truncated — pass rootSelector to read just that subtree, or filter:"interactive".',
     inputSchema: {
       type: 'object',
       properties: {
         tabId: { type: 'number' },
         filter: { type: 'string', enum: ['all', 'interactive'], default: 'all' },
-        depth: { type: 'number', default: 15 },
+        depth: { type: 'number', default: 30 },
         maxChars: { type: 'number', default: 50000 },
+        rootSelector: { type: 'string', description: 'Read only this element\'s subtree. Use for dialogs, popovers and overlays in a large page.' },
       },
     },
   },
@@ -493,7 +499,7 @@ const TOOLS = [
   },
   {
     name: 'computer',
-    description: 'Perform browser actions with real CDP input. Clicks, typing and scrolling dispatch trusted events, so this works where synthetic DOM events are ignored — canvas tiles, drag surfaces, rich editors and virtual lists. Pass ref and the element is located and scrolled into view first; typing is verified by reading the field back. click_where targets by selector or predicate when nothing in the tree names the element; scroll_until drives a virtual list with real wheel events until something appears.',
+    description: 'Perform browser actions with real CDP input — clicks, typing and scrolling all dispatch trusted events, so they work where synthetic DOM events are ignored (canvas tiles, drag surfaces, rich editors, virtual lists). **Prefer act_until for anything whose success is checkable**: it locates, acts, verifies and retries in one call, so coordinates cannot go stale between steps and the check cannot run before the click settles. Set untilGone for deselect/close/collapse. click_where is the one-shot version; scroll_until drives a virtual list until something appears.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -502,9 +508,17 @@ const TOOLS = [
           type: 'string',
           enum: [
             'left_click', 'right_click', 'double_click', 'type', 'key',
-            'scroll', 'scroll_until', 'scroll_to', 'click_where', 'wait', 'screenshot',
+            'scroll', 'scroll_until', 'scroll_to', 'click_where', 'act_until', 'wait', 'screenshot',
           ],
         },
+        op: { type: 'string', description: 'act_until: the operation to repeat — left_click (default), right_click, double_click, type, key.' },
+        until: {
+          type: 'object',
+          description: 'act_until: the condition that means it worked. One of js (arrow function), selector, or text.',
+          properties: { js: { type: 'string' }, selector: { type: 'string' }, text: { type: 'string' } },
+        },
+        untilGone: { type: 'boolean', default: false, description: 'act_until: wait for the condition to STOP holding. Use for deselect, close and collapse — the opposite direction is a common source of wrong-way retries.' },
+        maxAttempts: { type: 'number', default: 3, description: 'act_until: how many times to retry before failing.' },
         selector: { type: 'string', description: 'click_where / scroll_until: CSS selector for the target.' },
         predicateJs: { type: 'string', description: 'click_where: arrow function picking the element, e.g. "el => el.src.includes(\'abc\')". Use when no selector or ref can name it.' },
         verifyJs: { type: 'string', description: 'click_where: arrow function checked after the click; the call fails if it does not hold.' },

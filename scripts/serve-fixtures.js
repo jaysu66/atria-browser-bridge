@@ -25,8 +25,21 @@ const server = http.createServer((req, res) => {
   });
 });
 
+// Someone already serving this port is the normal case when a fixture server was
+// left running, and it serves the same directory. Reuse it instead of taking the
+// whole acceptance run down with an unhandled error event.
+let reused = false;
+server.on('error', (error) => {
+  if (error.code === 'EADDRINUSE') {
+    reused = true;
+    if (require.main === module) console.log(`fixtures already served on http://127.0.0.1:${port}`);
+    return;
+  }
+  throw error;
+});
+
 server.listen(port, '127.0.0.1', () => {
   if (require.main === module) console.log(`fixtures on http://127.0.0.1:${port}`);
 });
 
-module.exports = { server, port };
+module.exports = { server, port, isReused: () => reused };
