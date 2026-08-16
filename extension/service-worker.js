@@ -300,6 +300,15 @@ async function withDebugger(tabId, fn) {
 // page. The bridge exists to operate tabs, not to control the browser process.
 const CDP_DENIED = /^(Browser\.|Target\.(close|createTarget|disposeBrowserContext)|Page\.close|Storage\.clearDataForOrigin)/;
 
+// Inches, as Page.printToPDF expects.
+const PAPER_SIZES = {
+  letter: [8.5, 11],
+  legal: [8.5, 14],
+  tabloid: [11, 17],
+  a3: [11.7, 16.5],
+  a4: [8.27, 11.7]
+};
+
 // withDebugger attaches and detaches around a single call, which suits one-shot
 // commands but cannot receive events. Network capture and request blocking need
 // the attachment to outlive the call, so those tabs get a session here and the
@@ -800,7 +809,48 @@ async function extractPage(tab, args) {
   return contentResult(extracted);
 }
 
-async function captureScreenshot(tab) {
+async function captureScreenshot(tab, args = {}) {
+  let clip = args.clip || null;
+  if (!clip && args.ref) {
+    const spot = await sendToContent(tab.id, { type: "atria.refRect", ref: args.ref });
+    if (!spot?.ok) return toolError(spot?.message || `cannot locate ${args.ref}`, { code: "NOT_FOUND" });
+    clip = { x: spot.x - spot.width / 2, y: spot.y - spot.height / 2, width: spot.width, height: spot.height };
+  }
+  // A clip is a CDP-only capability, and it also needs page coordinates rather
+  // than viewport ones, so scroll offset has to be added back in.
+  if (clip) {
+    const offset = await withDebugger(tab.id, async (cdp) => {
+      const result = await cdp("Runtime.evaluate", { expression: "JSON.stringify({x:scrollX,y:scrollY})", returnByValue: true });
+      try {
+        return JSON.parse(result?.result?.value || "{}");
+      } catch (_) {
+        return {};
+      }
+    });
+    const shot = await withDebugger(tab.id, async (cdp) => {
+      await cdp("Page.enable");
+      return cdp("Page.captureScreenshot", {
+        format: "jpeg",
+        quality: Number(args.quality || 70),
+        captureBeyondViewport: true,
+        clip: {
+          x: Math.max(0, Math.round(clip.x + (offset.x || 0))),
+          y: Math.max(0, Math.round(clip.y + (offset.y || 0))),
+          width: Math.max(1, Math.round(clip.width)),
+          height: Math.max(1, Math.round(clip.height)),
+          scale: 1
+        }
+      });
+    });
+    if (!shot?.data) return captureDomSnapshot(tab, "clip screenshot returned empty image");
+    return {
+      content: [
+        { type: "image", mimeType: "image/jpeg", data: shot.data },
+        { type: "text", text: `Clipped screenshot from tab ${tab.id} via debugger.Page.captureScreenshot` }
+      ]
+    };
+  }
+
   let data = "";
   let method = "tabs.captureVisibleTab";
   // captureVisibleTab only takes a windowId, so it grabs whatever tab is visible
@@ -1026,7 +1076,7 @@ async function executeTool(name, args) {
     const action = args.action;
     await setIndicator(tab.id, true);
     try {
-      if (action === "screenshot") return await captureScreenshot(tab);
+      if (action === "screenshot") return await captureScreenshot(tab, args);
       if (action === "wait") {
         await sleep(Math.min(Number(args.duration || args.durationMs || 1000), 10000));
         return contentResult({ waited: true });
@@ -1099,6 +1149,26 @@ async function executeTool(name, args) {
     } finally {
       await setIndicator(tab.id, false);
     }
+  }
+
+  if (name === "save_as_pdf") {
+    const tab = await resolveTab(args.tabId);
+    const result = await withDebugger(tab.id, async (cdp) => {
+      await cdp("Page.enable");
+      return cdp("Page.printToPDF", {
+        landscape: Boolean(args.landscape),
+        printBackground: args.printBackground !== false,
+        scale: Math.min(Math.max(Number(args.scale || 1), 0.1), 2),
+        paperWidth: PAPER_SIZES[String(args.paperFormat || "letter").toLowerCase()]?.[0] || 8.5,
+        paperHeight: PAPER_SIZES[String(args.paperFormat || "letter").toLowerCase()]?.[1] || 11
+      });
+    });
+    if (!result?.data) return toolError("printToPDF returned no data", { code: "CDP_ERROR" });
+    return {
+      content: [
+        { type: "text", text: JSON.stringify({ pdfBase64: result.data, tabId: tab.id, pageTitle: tab.title }) }
+      ]
+    };
   }
 
   if (name === "wait_for") {

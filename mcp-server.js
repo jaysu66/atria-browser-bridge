@@ -460,7 +460,7 @@ const TOOLS = [
   },
   {
     name: 'computer',
-    description: 'Perform browser actions: left_click, right_click, double_click, type, key, scroll, scroll_to, wait, screenshot.',
+    description: 'Perform browser actions with real CDP input: left_click, right_click, double_click, type, key, scroll, scroll_to, wait, screenshot. Clicks and typing dispatch trusted events, so this works where synthetic DOM events are ignored. Pass ref and the element is located and scrolled into view first; typing is verified by reading the field back.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -469,15 +469,35 @@ const TOOLS = [
           type: 'string',
           enum: ['left_click', 'right_click', 'double_click', 'type', 'key', 'scroll', 'scroll_to', 'wait', 'screenshot'],
         },
-        ref: { type: 'string' },
+        ref: { type: 'string', description: 'Target element. For screenshot, crops to this element.' },
         coordinate: {},
         text: { type: 'string' },
         key: { type: 'string' },
         direction: { type: 'string' },
         amount: { type: 'number' },
         duration: { type: 'number' },
+        clip: {
+          type: 'object',
+          description: 'screenshot only: crop to this viewport rect.',
+          properties: { x: { type: 'number' }, y: { type: 'number' }, width: { type: 'number' }, height: { type: 'number' } },
+        },
+        quality: { type: 'number', default: 70, description: 'screenshot only: JPEG quality.' },
       },
       required: ['action'],
+    },
+  },
+  {
+    name: 'save_as_pdf',
+    description: 'Render a tab to PDF via CDP and return it. Useful for archiving evidence of a page exactly as it rendered.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        paperFormat: { type: 'string', enum: ['letter', 'legal', 'tabloid', 'a3', 'a4'], default: 'letter' },
+        landscape: { type: 'boolean', default: false },
+        scale: { type: 'number', default: 1 },
+        printBackground: { type: 'boolean', default: true },
+      },
     },
   },
   {
