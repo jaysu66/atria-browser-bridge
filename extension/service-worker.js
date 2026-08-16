@@ -2,6 +2,10 @@ const DEFAULT_BRIDGE_PORT = 47652;
 const BRIDGE_PORT_KEY = "atriaBridgePort";
 const EXTENSION_VERSION = chrome.runtime.getManifest().version;
 const AGENT_GROUP_TITLE = "Atria Agent";
+// Must match PROTOCOL_VERSION in mcp-server.js. Reported on every poll so the
+// server can tell the user "reload the extension" instead of leaving a stale
+// extension to fail in confusing ways.
+const PROTOCOL_VERSION = 2;
 const AGENT_GROUP_COLOR = "green";
 
 let clientIdPromise = null;
@@ -143,39 +147,86 @@ async function resolveTab(tabId) {
   return active;
 }
 
-async function getStoredAgentGroupId() {
-  const stored = await chrome.storage.local.get("atriaAgentTabGroupId");
-  const groupId = stored.atriaAgentTabGroupId;
+// Tabs are tracked per group title rather than as a single group, so two
+// concurrent tasks can each keep their own labelled group instead of piling
+// every tab they open into one undifferentiated pile.
+const GROUP_MAP_KEY = "atriaAgentTabGroups";
+
+async function readGroupMap() {
+  const stored = await chrome.storage.local.get(GROUP_MAP_KEY);
+  const map = stored[GROUP_MAP_KEY];
+  return map && typeof map === "object" ? map : {};
+}
+
+async function getStoredGroupId(title) {
+  const map = await readGroupMap();
+  const groupId = map[title];
   if (typeof groupId !== "number" || groupId < 0) return null;
   try {
     await chrome.tabGroups.get(groupId);
     return groupId;
   } catch (_) {
-    await chrome.storage.local.remove("atriaAgentTabGroupId");
+    delete map[title];
+    await chrome.storage.local.set({ [GROUP_MAP_KEY]: map });
     return null;
   }
 }
 
-async function groupAgentTab(tabId) {
-  let groupId = await getStoredAgentGroupId();
+async function listAgentGroups() {
+  const map = await readGroupMap();
+  const groups = [];
+  for (const [title, groupId] of Object.entries(map)) {
+    try {
+      const group = await chrome.tabGroups.get(groupId);
+      groups.push({ id: group.id, title: group.title || title, color: group.color, collapsed: group.collapsed, windowId: group.windowId });
+    } catch (_) {}
+  }
+  return groups;
+}
+
+async function groupAgentTab(tabId, groupTitle) {
+  const title = groupTitle ? String(groupTitle).slice(0, 60) : AGENT_GROUP_TITLE;
+  let groupId = await getStoredGroupId(title);
   if (groupId !== null) {
     try {
       groupId = await chrome.tabs.group({ tabIds: [tabId], groupId });
     } catch (_) {
       groupId = null;
-      await chrome.storage.local.remove("atriaAgentTabGroupId");
     }
   }
   if (groupId === null) {
     groupId = await chrome.tabs.group({ tabIds: [tabId] });
   }
   await chrome.tabGroups.update(groupId, {
-    title: AGENT_GROUP_TITLE,
+    title,
     color: AGENT_GROUP_COLOR,
     collapsed: false
   });
-  await chrome.storage.local.set({ atriaAgentTabGroupId: groupId });
+  const map = await readGroupMap();
+  map[title] = groupId;
+  await chrome.storage.local.set({ [GROUP_MAP_KEY]: map });
   return groupId;
+}
+
+// Politeness has to live here rather than in each agent's runner: with several
+// tabs crawling at once, per-runner pacing still lets them all hit one host
+// together. Keyed by hostname so unrelated domains never wait on each other.
+const domainLastHit = new Map();
+
+async function throttleDomain(url, override) {
+  const minInterval = Number(override ?? 0);
+  if (!Number.isFinite(minInterval) || minInterval <= 0) return 0;
+  let host;
+  try {
+    host = new URL(url).hostname;
+  } catch (_) {
+    return 0;
+  }
+  const last = domainLastHit.get(host) || 0;
+  const waitMs = Math.max(0, last + minInterval - Date.now());
+  if (waitMs > 0) await sleep(waitMs);
+  domainLastHit.set(host, Date.now());
+  return waitMs;
 }
 
 function waitForTabLoad(tabId, timeoutMs = 30000) {
@@ -807,23 +858,17 @@ async function executeTool(name, args) {
 
   if (name === "tabs_context") {
     const tabs = await chrome.tabs.query({});
-    let agentGroup = null;
-    const groupId = await getStoredAgentGroupId();
-    if (groupId !== null) {
-      try {
-        const group = await chrome.tabGroups.get(groupId);
-        agentGroup = { id: group.id, title: group.title, color: group.color, collapsed: group.collapsed, windowId: group.windowId };
-      } catch (_) {
-        agentGroup = null;
-      }
-    }
+    const agentGroups = await listAgentGroups();
+    const byId = new Map(agentGroups.map((group) => [group.id, group]));
     return contentResult({
-      agentGroup,
+      agentGroups,
+      agentGroup: agentGroups.find((group) => group.title === AGENT_GROUP_TITLE) || agentGroups[0] || null,
       tabs: tabs.map((tab) => ({
         id: tab.id,
         windowId: tab.windowId,
         groupId: tab.groupId,
-        isAgentTab: agentGroup ? tab.groupId === agentGroup.id : false,
+        isAgentTab: byId.has(tab.groupId),
+        agentGroupTitle: byId.get(tab.groupId)?.title || null,
         active: tab.active,
         title: tab.title,
         url: tab.url
@@ -836,9 +881,29 @@ async function executeTool(name, args) {
     let groupId = tab.groupId;
     // 强制进 Atria Agent group,LLM 不可绕过(忽略 args.group 旧字段)
     if (tab.id !== undefined) {
-      groupId = await groupAgentTab(tab.id);
+      groupId = await groupAgentTab(tab.id, args.groupTitle);
     }
-    return contentResult({ id: tab.id, windowId: tab.windowId, groupId, agentGroupTitle: groupId >= 0 ? AGENT_GROUP_TITLE : null, url: tab.url, title: tab.title });
+    const title = args.groupTitle ? String(args.groupTitle) : AGENT_GROUP_TITLE;
+    return contentResult({ id: tab.id, windowId: tab.windowId, groupId, agentGroupTitle: groupId >= 0 ? title : null, url: tab.url, title: tab.title });
+  }
+
+  if (name === "tabs_activate") {
+    if (args.tabId === undefined || args.tabId === null) return toolError("tabId is required", { code: "BAD_ARGS" });
+    const tabId = Number(args.tabId);
+    let tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch (_) {
+      return toolError(`tab ${tabId} no longer exists`, { code: "TAB_GONE", tabId });
+    }
+    // Bringing the window forward matters as much as selecting the tab: this
+    // exists so the agent can put a bot check in front of the user instead of
+    // describing which tab to go find.
+    await chrome.tabs.update(tabId, { active: true });
+    try {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    } catch (_) {}
+    return contentResult({ activated: true, tabId, windowId: tab.windowId, url: tab.url, title: tab.title });
   }
 
   if (name === "tabs_close") {
@@ -848,7 +913,20 @@ async function executeTool(name, args) {
   }
 
   if (name === "navigate") {
-    const tab = await resolveTab(args.tabId);
+    let tab;
+    try {
+      tab = await resolveTab(args.tabId);
+    } catch (error) {
+      // "No tab with given id" is routine: the user closed it, or Chrome
+      // restarted. Distinguish it from an extension fault, and optionally
+      // replace the tab rather than making the caller unwind its whole plan.
+      if (!args.recreateIfGone || !args.url) {
+        return toolError(`tab ${args.tabId} no longer exists`, { code: "TAB_GONE", tabId: args.tabId });
+      }
+      const fresh = await chrome.tabs.create({ url: "about:blank", active: false });
+      await groupAgentTab(fresh.id, args.groupTitle);
+      tab = fresh;
+    }
     if (args.direction === "back") {
       await chrome.tabs.goBack(tab.id);
       await waitForTabLoad(tab.id, 10000);
@@ -860,11 +938,17 @@ async function executeTool(name, args) {
       return contentResult({ navigated: true, direction: "forward", tabId: tab.id });
     }
     if (!args.url) throw new Error("url is required");
+    const throttled = await throttleDomain(args.url, args.minIntervalMsPerDomain);
     const wait = waitForTabLoad(tab.id, Number(args.timeoutMs || 30000));
     await chrome.tabs.update(tab.id, { url: args.url });
     await wait;
     const next = await chrome.tabs.get(tab.id);
-    return contentResult({ navigated: true, tabId: tab.id, url: next.url, title: next.title });
+    let state = null;
+    try {
+      const probe = await sendToContent(tab.id, { type: "atria.pageState" });
+      if (probe?.ok) state = probe.state;
+    } catch (_) {}
+    return contentResult({ navigated: true, tabId: tab.id, url: next.url, title: next.title, throttledMs: throttled, pageState: state });
   }
 
   if (name === "read_page") {
@@ -1161,17 +1245,48 @@ async function executeTool(name, args) {
   }
 
   if (name === "browser_batch") {
-    const outputs = [];
-    const actions = Array.isArray(args.actions) ? args.actions : [];
-    for (const item of actions) {
-      const result = await executeTool(item.name, item.input || item.arguments || {});
-      outputs.push({ name: item.name, result });
-      if (result?.isError) break;
+    return contentResult(await runBatch(args.actions, Boolean(args.continueOnError)));
+  }
+
+  if (name === "browser_parallel") {
+    const batches = Array.isArray(args.batches) ? args.batches : [];
+    if (!batches.length) return toolError("batches is required", { code: "BAD_ARGS" });
+    if (batches.some((batch) => (batch.actions || []).some((step) => step.name === "browser_parallel"))) {
+      return toolError("browser_parallel cannot nest", { code: "BAD_ARGS" });
     }
-    return contentResult(outputs);
+    // Each batch drives its own tab, so they can genuinely run at the same time.
+    // The transport hands the extension one command at a time; fanning out here
+    // rather than at the server keeps the queue untouched.
+    const results = await Promise.all(
+      batches.map(async (batch, index) => {
+        const actions = (batch.actions || []).map((step) => ({
+          ...step,
+          input: { ...(step.input || step.arguments || {}), ...(batch.tabId !== undefined ? { tabId: batch.tabId } : {}) }
+        }));
+        try {
+          return { index, tabId: batch.tabId, ok: true, steps: await runBatch(actions, batch.continueOnError !== false) };
+        } catch (error) {
+          return { index, tabId: batch.tabId, ok: false, error: error?.message || String(error) };
+        }
+      })
+    );
+    return contentResult({ batches: results });
   }
 
   return toolError(`Tool not implemented in extension: ${name}`);
+}
+
+async function runBatch(actions, continueOnError) {
+  const outputs = [];
+  for (const item of Array.isArray(actions) ? actions : []) {
+    const result = await executeTool(item.name, item.input || item.arguments || {});
+    const failed = Boolean(result?.isError);
+    outputs.push({ name: item.name, ok: !failed, result });
+    // Crawling a list of pages should not lose pages 4 and 5 because page 3
+    // hit a dead link, so the caller decides whether a failure ends the run.
+    if (failed && !continueOnError) break;
+  }
+  return outputs;
 }
 
 async function handleEnvelope(envelope) {
@@ -1186,7 +1301,7 @@ async function handleEnvelope(envelope) {
 async function pollOnce() {
   const clientId = await getClientId();
   const base = await bridgeBase("http");
-  const response = await fetch(`${base}/extension/next?clientId=${encodeURIComponent(clientId)}&version=${encodeURIComponent(EXTENSION_VERSION)}`, {
+  const response = await fetch(`${base}/extension/next?clientId=${encodeURIComponent(clientId)}&version=${encodeURIComponent(EXTENSION_VERSION)}&protocol=${PROTOCOL_VERSION}`, {
     cache: "no-store"
   });
   if (response.status === 204) return;

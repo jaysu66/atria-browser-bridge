@@ -39,6 +39,11 @@ const HOST = process.env.ATRIA_BROWSER_HOST || '127.0.0.1';
 const PORT = resolvePort();
 const REQUEST_TIMEOUT_MS = Number(process.env.ATRIA_BROWSER_REQUEST_TIMEOUT_MS || 60000);
 const STANDALONE = process.argv.includes('--standalone') || process.env.ATRIA_BROWSER_STANDALONE === '1';
+const MIN_INTERVAL_MS = Number(process.env.ATRIA_BROWSER_MIN_INTERVAL_MS || 0);
+// Bumped whenever the tool contract changes in a way an older extension cannot
+// serve. browser_status compares it against what the extension reports so a
+// stale extension is named as the cause instead of surfacing as odd failures.
+const PROTOCOL_VERSION = 2;
 
 const pendingQueue = [];
 const waiters = [];
@@ -48,6 +53,7 @@ const bridgeState = {
   startedAt: new Date().toISOString(),
   extensionClientId: null,
   extensionVersion: null,
+  protocolVersion: null,
   lastSeenAt: null,
 };
 
@@ -91,6 +97,8 @@ function markExtension(req) {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   bridgeState.extensionClientId = url.searchParams.get('clientId') || bridgeState.extensionClientId;
   bridgeState.extensionVersion = url.searchParams.get('version') || bridgeState.extensionVersion;
+  // Absent means an extension from before the handshake existed, i.e. protocol 1.
+  bridgeState.protocolVersion = Number(url.searchParams.get('protocol') || 1);
   bridgeState.lastSeenAt = new Date().toISOString();
 }
 
@@ -160,9 +168,14 @@ function attachExtensionSocket(req, socket) {
 // clears a bot check — so the transport must outlive its own timeout rather
 // than cutting the call off at the default and reporting a bridge failure.
 function timeoutFor(tool, args) {
-  if (tool !== 'wait_for') return REQUEST_TIMEOUT_MS;
-  const requested = Number(args?.timeoutMs || 30000);
-  return Math.min(Math.max(requested, 1000), 900000) + 15000;
+  if (tool === 'wait_for') {
+    const requested = Number(args?.timeoutMs || 30000);
+    return Math.min(Math.max(requested, 1000), 900000) + 15000;
+  }
+  // A batch is many steps in one call and may contain a wait_for of its own, so
+  // the default single-action budget does not apply.
+  if (tool === 'browser_batch' || tool === 'browser_parallel') return Math.max(REQUEST_TIMEOUT_MS, 300000);
+  return REQUEST_TIMEOUT_MS;
 }
 
 function enqueueTool(tool, args) {
@@ -303,6 +316,11 @@ function callBrowser(tool, args) {
       ],
     });
   }
+  // A global politeness floor belongs on the server, where every tab and every
+  // concurrent task passes through it, not in each caller's loop.
+  if (tool === 'navigate' && args && args.minIntervalMsPerDomain === undefined && MIN_INTERVAL_MS > 0) {
+    args = { ...args, minIntervalMsPerDomain: MIN_INTERVAL_MS };
+  }
   return enqueueTool(tool, args);
 }
 
@@ -325,7 +343,7 @@ const TOOLS = [
       properties: {
         url: { type: 'string' },
         active: { type: 'boolean', default: true },
-        group: { type: 'boolean', default: true, description: 'When true, put the tab into the Atria Agent Chrome tab group.' },
+        groupTitle: { type: 'string', description: 'Label for this task\'s tab group. Reuse one title for a whole task so its tabs stay together and separate from other tasks. Defaults to "Atria Agent".' },
       },
     },
   },
@@ -340,7 +358,7 @@ const TOOLS = [
   },
   {
     name: 'navigate',
-    description: 'Navigate a tab to a URL, or go back/forward.',
+    description: 'Navigate a tab to a URL, or go back/forward. The result carries pageState, so a bot check is visible immediately without a second call.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -348,7 +366,19 @@ const TOOLS = [
         url: { type: 'string' },
         direction: { type: 'string', enum: ['back', 'forward'] },
         timeoutMs: { type: 'number', default: 30000 },
+        recreateIfGone: { type: 'boolean', default: false, description: 'If the tab was closed, open a replacement instead of failing with TAB_GONE.' },
+        groupTitle: { type: 'string', description: 'Group title to use when recreating the tab.' },
+        minIntervalMsPerDomain: { type: 'number', description: 'Politeness delay between navigations to the same hostname. Defaults to ATRIA_BROWSER_MIN_INTERVAL_MS.' },
       },
+    },
+  },
+  {
+    name: 'tabs_activate',
+    description: 'Bring a tab to the front and focus its window. Use this to put a page in front of the user when they need to act on it — solving a bot check, for example — instead of describing which tab to open.',
+    inputSchema: {
+      type: 'object',
+      properties: { tabId: { type: 'number' } },
+      required: ['tabId'],
     },
   },
   {
@@ -464,7 +494,7 @@ const TOOLS = [
   },
   {
     name: 'browser_batch',
-    description: 'Run browser tools sequentially. Stops at the first error. No nested browser_batch.',
+    description: 'Run browser tools sequentially in one round trip. Stops at the first error unless continueOnError is set. No nested browser_batch.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -479,8 +509,38 @@ const TOOLS = [
             required: ['name'],
           },
         },
+        continueOnError: { type: 'boolean', default: false, description: 'Run every step and report ok per step instead of stopping at the first failure.' },
       },
       required: ['actions'],
+    },
+  },
+  {
+    name: 'browser_parallel',
+    description: 'Run several batches at the same time, one per tab. Use for crawling many pages at once: open N tabs, then give each its own navigate/extract sequence. Each batch is independent — one failing does not affect the others.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        batches: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              tabId: { type: 'number', description: 'Applied to every step in this batch.' },
+              continueOnError: { type: 'boolean', default: true },
+              actions: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: { name: { type: 'string' }, input: { type: 'object' } },
+                  required: ['name'],
+                },
+              },
+            },
+            required: ['actions'],
+          },
+        },
+      },
+      required: ['batches'],
     },
   },
   {
@@ -585,6 +645,13 @@ HANDLERS.browser_status = async () => ({
         {
           ok: true,
           endpoint: `http://${HOST}:${PORT}`,
+          protocolVersion: PROTOCOL_VERSION,
+          extensionProtocolVersion: bridgeState.protocolVersion ?? null,
+          versionWarning:
+            bridgeState.lastSeenAt && (bridgeState.protocolVersion ?? 1) < PROTOCOL_VERSION
+              ? `The connected extension speaks protocol ${bridgeState.protocolVersion ?? 1} but this server expects ${PROTOCOL_VERSION}. Reload the extension at chrome://extensions to pick up the newer tools.`
+              : null,
+          minIntervalMsPerDomain: MIN_INTERVAL_MS,
           bridgeState,
           pending: pendingQueue.length,
           waitingExtensionPolls: waiters.length,
