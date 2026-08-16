@@ -57,24 +57,22 @@
           信用卡号
           <input name="card" autocomplete="cc-number" value="4242424242424242">
         </label>
-        <!-- 以下四个是真实世界里最常见的形态：普通 text 输入框，没有任何
-             autocomplete 提示，只能靠 name/id 判断敏感。 -->
+        <!-- 有 label 包裹：验证敏感字段仍然保留可读标签，而不是塌成
+             "[value redacted]" 导致 agent 找不到这个框。 -->
         <label>
           短信验证码
           <input name="otp" inputmode="numeric" value="884213">
         </label>
-        <label>
-          安全码
-          <input name="cvv" value="311">
-        </label>
-        <label>
-          接口密钥
-          <input id="api_token" value="sk-live-9f3a2b7c4d1e8055">
-        </label>
-        <label>
-          旧密码（非 password 类型）
-          <input name="old_password" value="hunter2-legacy">
-        </label>
+
+        <!-- 无 label、无 aria-label、无 placeholder：labelFor 只能拿 value 当
+             标签，这是唯一会把字段内容写进无障碍树的路径。普通 text 输入 +
+             没有 autocomplete 提示，只能靠 name/id 判断敏感。 -->
+        <input name="cvv" value="311">
+        <input id="api_token" value="sk-live-9f3a2b7c4d1e8055">
+        <input name="old_password" value="hunter2-legacy">
+
+        <!-- 反向对照：非敏感的裸输入框，value 必须照常出现，确认没有过度脱敏。 -->
+        <input name="nickname" value="老张">
         <label>
           城市
           <select name="city">
