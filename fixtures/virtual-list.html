@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <title>Atria Virtual List Fixture</title>
+    <style>
+      body { margin: 0; font: 14px/1.5 system-ui, sans-serif; }
+      #grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 12px; }
+      .tile { height: 90px; display: grid; place-items: center; border: 1px solid #d8d2c6; border-radius: 6px; }
+      #status { position: fixed; top: 0; right: 0; background: #22543d; color: #fff; padding: 4px 8px; }
+    </style>
+  </head>
+  <body>
+    <div id="status">已加载 <span id="count">0</span></div>
+    <div id="grid"></div>
+    <script>
+      // 只在收到**真实滚轮事件**时加载下一批。
+      // window.scrollBy / scrollTop 赋值不会触发 wheel,所以合成滚动在这里永远
+      // 加载不出第 20 项之后的内容 —— 这正是虚拟列表在真实站点上的行为。
+      const grid = document.getElementById("grid");
+      const count = document.getElementById("count");
+      let loaded = 0;
+
+      function loadBatch(n = 20) {
+        for (let i = 0; i < n; i++) {
+          loaded += 1;
+          const tile = document.createElement("div");
+          tile.className = "tile";
+          tile.dataset.tile = String(loaded);
+          tile.textContent = "素材 " + loaded;
+          grid.appendChild(tile);
+        }
+        count.textContent = String(loaded);
+      }
+
+      loadBatch(20);
+      window.addEventListener("wheel", () => { if (loaded < 200) loadBatch(20); }, { passive: true });
+    </script>
+  </body>
+</html>

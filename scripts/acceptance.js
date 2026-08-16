@@ -54,12 +54,28 @@ function check(name, pass, detail) {
   console.log(`${pass ? 'PASS' : 'FAIL'}  ${name}\n      ${String(detail).replace(/\s+/g, ' ').slice(0, 150)}`);
 }
 
+// browser_status is answered by the server alone, so it says nothing about
+// whether the extension is ready to take work — after a reload its poll loop
+// needs a moment to come back. Wait for a command it actually has to serve.
+async function waitForExtension(timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = '';
+  while (Date.now() < deadline) {
+    const probe = await call('tabs_context', {});
+    if (!probe?.result?.isError) return;
+    last = text(probe).slice(0, 120);
+    await sleep(750);
+  }
+  throw new Error(`extension did not become ready within ${timeoutMs}ms: ${last}`);
+}
+
 async function main() {
   const health = await call('browser_status', {});
   const status = json(health);
   if (!status?.bridgeState?.lastSeenAt) {
     throw new Error('extension is not connected — load it at chrome://extensions and open the popup once');
   }
+  await waitForExtension();
   if ((status.extensionProtocolVersion ?? 1) < status.protocolVersion) {
     throw new Error(`extension speaks protocol ${status.extensionProtocolVersion}, server expects ${status.protocolVersion} — reload the extension`);
   }
@@ -68,6 +84,16 @@ async function main() {
   const open = async (url, active = false) => {
     const tab = json(await call('tabs_create', { url, active, groupTitle: GROUP }));
     opened.push(tab.id);
+    // Pin a viewport for the tab under test. Otherwise the suite silently
+    // depends on the size of whatever window Chrome happens to have open — a
+    // minimized one reports 0x0, every coordinate becomes meaningless, and
+    // clicking and scrolling fail for reasons that have nothing to do with the
+    // code being tested.
+    await call('cdp_tool', {
+      tabId: tab.id,
+      method: 'Emulation.setDeviceMetricsOverride',
+      params: { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false },
+    });
     await sleep(1200);
     return tab;
   };
@@ -123,8 +149,14 @@ async function main() {
     // The original bug: captureVisibleTab ignores tabId.
     const bg = await open(base('fake-challenge.html'), false);
     const shot = await call('computer', { tabId: bg.id, action: 'screenshot' });
-    const method = (text(shot).match(/via ([\w.]+)/) || [])[1];
-    check('background-tab screenshot targets that tab', method === 'debugger.Page.captureScreenshot', `via ${method}`);
+    const method = (text(shot).match(/via ([\w.+]+)/) || [])[1];
+    // What matters is that the image is of the requested tab, not how it was
+    // obtained. CDP capture and activate-then-capture both target it; plain
+    // captureVisibleTab on a background tab returns the wrong page, and a DOM
+    // snapshot is not a screenshot at all.
+    const targeted = ['debugger.Page.captureScreenshot', 'activate+captureVisibleTab'].includes(method);
+    const hasImage = (shot.result.content || []).some((b) => b.type === 'image' && (b.data || '').length > 2000);
+    check('background-tab screenshot targets that tab', targeted && hasImage, `via ${method}, image=${hasImage}`);
 
     const state = json(await call('get_page_text', { tabId: bg.id, maxChars: 500 }));
     check('bot check is detected', state.pageState.challenge === 'cloudflare', state.pageState.title);
@@ -154,6 +186,26 @@ async function main() {
     const images = blockedList.requests.filter((r) => r.resourceType === 'image');
     check('request blocking drops images', cleared.blocked > 0 && images.every((r) => r.failed), `${cleared.blocked} blocked`);
     await call('network_stop', { tabId: blocked.id });
+
+    // The fixture only loads more tiles on a real wheel event, so this fails
+    // outright if scroll ever goes back to window.scrollBy in the page.
+    const virtual = await open(base('virtual-list.html'), true);
+    const before = json(await call('javascript_tool', { tabId: virtual.id, text: 'document.querySelectorAll(".tile").length' }));
+    const scrolled = await call('computer', { tabId: virtual.id, action: 'scroll_until', selector: '[data-tile="60"]', maxSteps: 15 });
+    const after = json(await call('javascript_tool', { tabId: virtual.id, text: 'document.querySelectorAll(".tile").length' }));
+    check(
+      'scroll_until drives a virtual list with real wheel events',
+      !scrolled.result.isError && Number(after.result) > Number(before.result),
+      `tiles ${before?.result} -> ${after?.result}, ${text(scrolled)}`
+    );
+
+    const clicked = await call('computer', {
+      tabId: virtual.id, action: 'click_where',
+      predicateJs: 'el => el.dataset && el.dataset.tile === "7"',
+      selector: '.tile',
+      verifyJs: '() => document.querySelector(\'[data-tile="7"]\') !== null',
+    });
+    check('click_where locates by predicate and clicks for real', !clicked.result.isError, text(clicked));
 
     const evaluated = json(await call('cdp_tool', { tabId: listing.id, method: 'Runtime.evaluate', params: { expression: '1+1', returnByValue: true } }));
     const refused = await call('cdp_tool', { tabId: listing.id, method: 'Browser.close' });

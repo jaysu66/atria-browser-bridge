@@ -193,12 +193,30 @@
   }
 
   function generatePageTree(opts) {
-    state.entries = walk(document.body || document.documentElement, opts || {});
-    const maxChars = Math.max(1000, Math.min(Number(opts?.maxChars || 50000), 200000));
-    let text = state.entries.map((entry) => entry.line).join("\n");
+    const options = opts || {};
+    // A dialog's contents sit at the end of a large app's DOM, so a whole-page
+    // tree hits maxChars and truncates them away — the overlay looks absent
+    // when it is merely last. rootSelector reads just that subtree instead.
+    let root = document.body || document.documentElement;
+    let rootMatched = null;
+    if (options.rootSelector) {
+      const scoped = document.querySelector(options.rootSelector);
+      rootMatched = Boolean(scoped);
+      if (scoped) root = scoped;
+    }
+    state.entries = walk(root, options);
+    const maxChars = Math.max(1000, Math.min(Number(options.maxChars || 50000), 200000));
+    const lines = state.entries.map((entry) => entry.line);
+    let text = lines.join("\n");
     let truncated = false;
+    let droppedLines = 0;
     if (text.length > maxChars) {
-      text = text.slice(0, maxChars) + "\n...[truncated]";
+      // Truncation cuts from the end, which is where dialogs and late-mounted
+      // overlays live. Say how much went missing so it reads as "there is more"
+      // rather than "that was the whole page".
+      const kept = text.slice(0, maxChars);
+      droppedLines = lines.length - kept.split("\n").length;
+      text = `${kept}\n...[truncated: ${droppedLines} more elements. Narrow with rootSelector, or use filter:"interactive"]`;
       truncated = true;
     }
     return {
@@ -207,6 +225,9 @@
       tree: text,
       entries: state.entries.filter((entry) => entry.ref).slice(0, 2000),
       truncated,
+      droppedLines,
+      rootSelector: options.rootSelector || null,
+      rootMatched,
       pageState: pageState()
     };
   }
@@ -424,6 +445,10 @@
       }
       if (message.type === "atria.pageState") {
         sendResponse({ ok: true, state: pageState() });
+        return true;
+      }
+      if (message.type === "atria.viewportCentre") {
+        sendResponse({ ok: true, x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2) });
         return true;
       }
       if (message.type === "atria.refRect") {

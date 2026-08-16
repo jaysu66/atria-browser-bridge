@@ -92,7 +92,22 @@ async function start() {
 function parseArgs(raw) {
   if (!raw) return {};
   const text = raw.startsWith('@') ? fs.readFileSync(raw.slice(1), 'utf8') : raw;
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    // "Bad escaped character in JSON at position 286" is useless on its own.
+    // Show the offending stretch, and name the usual cause: a regex escape like
+    // \s or \d written straight into a JSON string, where it has to be \\s.
+    const at = Number((error.message.match(/position (\d+)/) || [])[1]);
+    if (!Number.isFinite(at)) throw error;
+    const snippet = text.slice(Math.max(0, at - 40), at + 40).replace(/\n/g, '\\n');
+    const caret = ' '.repeat(Math.min(at, 40)) + '^';
+    const stray = /\\[^"\\/bfnrtu]/.exec(text.slice(Math.max(0, at - 2), at + 2));
+    throw new Error(
+      `${error.message}\n  ...${snippet}...\n     ${caret}` +
+        (stray ? `\n  Looks like a lone backslash escape (${stray[0]}). Inside a JSON string a regex escape must be doubled: \\\\s, \\\\d.` : '')
+    );
+  }
 }
 
 function extractPdf(text) {
@@ -146,14 +161,35 @@ async function main() {
     return;
   }
 
+  // `--js <file.js> [tabId]` sidesteps JSON escaping entirely: the script is read
+  // as a file and the request is built here, so regex escapes like \s never have
+  // to survive a hand-written JSON string.
+  if (first === '--js') {
+    const [, file, tabId] = process.argv.slice(2);
+    if (!file) throw new Error('usage: node bridge.js --js <file.js> [tabId]');
+    const code = fs.readFileSync(file, 'utf8');
+    const jsBody = { name: 'javascript_tool', arguments: { text: code, ...(tabId ? { tabId: Number(tabId) } : {}) } };
+    const jsResponse = await request('POST', '/tools/call', jsBody);
+    fs.mkdirSync(OUT_DIR, { recursive: true });
+    process.stdout.write(`${materialize(jsResponse.result, `${process.pid}-js`)}\n`);
+    return;
+  }
+
   const body = { name: first, arguments: parseArgs(rawArgs) };
   let response;
   try {
     response = await request('POST', '/tools/call', body);
   } catch (error) {
-    if (error.code !== 'ECONNREFUSED') throw error;
-    await start();
-    response = await request('POST', '/tools/call', body);
+    if (error.code === 'ECONNREFUSED') {
+      await start();
+      response = await request('POST', '/tools/call', body);
+    } else if (error.code === 'ECONNRESET') {
+      // A keep-alive socket the server closed underneath us. The request never
+      // reached a tool, so retrying once is safe rather than a double action.
+      response = await request('POST', '/tools/call', body);
+    } else {
+      throw error;
+    }
   }
 
   fs.mkdirSync(OUT_DIR, { recursive: true });

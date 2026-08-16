@@ -97,7 +97,7 @@ async function connectSocket() {
     }
     const clientId = await getClientId();
     const base = await bridgeBase("ws");
-    const socket = new WebSocket(`${base}/extension/socket?clientId=${encodeURIComponent(clientId)}&version=${encodeURIComponent(EXTENSION_VERSION)}`);
+    const socket = new WebSocket(`${base}/extension/socket?clientId=${encodeURIComponent(clientId)}&version=${encodeURIComponent(EXTENSION_VERSION)}&protocol=${PROTOCOL_VERSION}`);
     bridgeSocket = socket;
 
     socket.onopen = () => {
@@ -430,6 +430,131 @@ async function clickAt(tabId, coordinate, button = "left", clickCount = 1) {
     await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, buttons: button === "right" ? 2 : 1, clickCount });
     await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, buttons: 0, clickCount });
   });
+}
+
+// Real wheel events over CDP. window.scrollBy in the page is a synthetic scroll:
+// it moves the viewport but virtual lists, infinite feeds and custom scroll
+// containers listen for wheel input and never load their next batch from it.
+async function scrollWheel(tabId, args) {
+  const direction = String(args.scroll_direction || args.direction || "down").toLowerCase();
+  const amount = Math.abs(Number(args.scroll_amount || args.amount || 600));
+  const axis = direction === "left" || direction === "right" ? "x" : "y";
+  const sign = direction === "up" || direction === "left" ? -1 : 1;
+  let x = Math.round(Number(args.coordinate?.x ?? args.coordinate?.[0] ?? NaN));
+  let y = Math.round(Number(args.coordinate?.y ?? args.coordinate?.[1] ?? NaN));
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    // Aim at the middle of the viewport: the wheel has to land over the
+    // scrollable container, not over whatever sits at 0,0. Read the size from
+    // the page directly rather than through the content script, which may be a
+    // stale injection in a tab that predates the last extension reload.
+    const size = await runInPage(tabId, () => ({ w: window.innerWidth, h: window.innerHeight }));
+    if (!size?.w || !size?.h) {
+      // Scrolling into a zero viewport silently does nothing, which reads as
+      // "the page ignored the wheel" and sends the caller chasing the wrong bug.
+      throw new Error(
+        `the window has no viewport (${size?.w ?? "?"}x${size?.h ?? "?"}) — it is minimized or collapsed, so wheel events land nowhere. Restore the browser window.`
+      );
+    }
+    x = Math.round(size.w / 2);
+    y = Math.round(size.h / 2);
+  }
+  await withDebugger(tabId, async (cdp) => {
+    // Chrome ignores a wheel event that arrives with no pointer position
+    // established, so move first and then scroll from the same point.
+    await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" });
+    await cdp("Input.dispatchMouseEvent", {
+      type: "mouseWheel",
+      x,
+      y,
+      button: "none",
+      deltaX: axis === "x" ? sign * amount : 0,
+      deltaY: axis === "y" ? sign * amount : 0
+    });
+  });
+  return { direction, amount, at: { x, y } };
+}
+
+// A caller-supplied predicate is a string, so evaluating it needs dynamic
+// evaluation — which MV3 forbids outright in a content script, extension CSP,
+// no exceptions. It has to happen in the page's own world, the same place
+// javascript_tool already runs.
+function runInPage(tabId, func, args) {
+  // args must be an array whenever func is used; passing undefined makes the
+  // injection resolve with no result rather than failing loudly.
+  return chrome.scripting
+    .executeScript({ target: { tabId }, world: "MAIN", func, args: args || [] })
+    .then((injection) => injection[0]?.result);
+}
+
+function locateInPage(tabId, selector, predicateJs) {
+  return runInPage(
+    tabId,
+    (sel, pred) => {
+      let el = null;
+      if (pred) {
+        let test;
+        try {
+          test = eval(`(${pred})`);
+        } catch (error) {
+          return { ok: false, code: "bad_predicate", message: `predicateJs did not compile: ${error.message}` };
+        }
+        el = Array.from(document.querySelectorAll(sel || "*")).find((candidate) => {
+          try {
+            return test(candidate);
+          } catch (_) {
+            return false;
+          }
+        });
+      } else if (sel) {
+        el = document.querySelector(sel);
+      }
+      if (!el) return { ok: false, code: "not_found", message: `nothing matched ${pred || sel}` };
+      // A minimized or collapsed window reports a zero viewport. Every
+      // coordinate is then meaningless: elementFromPoint returns null and the
+      // caller is told the target is "covered by null", which sends them
+      // hunting for an overlay that does not exist.
+      if (!window.innerWidth || !window.innerHeight) {
+        return {
+          ok: false,
+          code: "no_viewport",
+          message: `the window has no viewport (${window.innerWidth}x${window.innerHeight}) — it is minimized or collapsed, so nothing can be clicked by coordinate. Restore the browser window.`
+        };
+      }
+      el.scrollIntoView({ block: "center", inline: "center" });
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return { ok: false, code: "not_visible", message: "element has no layout box" };
+      const x = Math.round(rect.left + rect.width / 2);
+      const y = Math.round(rect.top + rect.height / 2);
+      const hit = document.elementFromPoint(x, y);
+      const covered = !hit || !(hit === el || el.contains(hit) || hit.contains(el));
+      return {
+        ok: true,
+        x,
+        y,
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        covered,
+        hit: covered && hit ? hit.tagName.toLowerCase() : null,
+        tag: el.tagName.toLowerCase()
+      };
+    },
+    [selector || null, predicateJs || null]
+  );
+}
+
+function evaluatePredicateInPage(tabId, predicateJs) {
+  return runInPage(
+    tabId,
+    (pred) => {
+      try {
+        const fn = eval(`(${pred})`);
+        return { ok: true, value: typeof fn === "function" ? fn() : fn };
+      } catch (error) {
+        return { ok: false, code: "bad_predicate", message: error.message };
+      }
+    },
+    [predicateJs]
+  );
 }
 
 async function typeText(tabId, text) {
@@ -965,8 +1090,34 @@ async function captureScreenshot(tab, args = {}) {
         "debugger.Page.captureScreenshot timeout"
       );
       data = result?.data || "";
-    } catch (error) {
-      return captureDomSnapshot(tab, error.message || String(error));
+    } catch (_) {
+      data = "";
+    }
+  }
+  if (!data && !tab.active) {
+    // Capturing a tab Chrome is not compositing is unreliable — it depends on
+    // version and on whether the tab was ever painted. Rather than hand back a
+    // DOM approximation and call it a screenshot, briefly bring the tab forward,
+    // take a real one, and put the user's tab back.
+    method = "activate+captureVisibleTab";
+    const previous = await getActiveTab();
+    try {
+      await chrome.tabs.update(tab.id, { active: true });
+      await sleep(250);
+      const dataUrl = await withTimeout(
+        chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 70 }),
+        5000,
+        "tabs.captureVisibleTab timeout"
+      );
+      [, data = ""] = dataUrl.split(",");
+    } catch (_) {
+      data = "";
+    } finally {
+      if (previous && previous.id !== tab.id) {
+        try {
+          await chrome.tabs.update(previous.id, { active: true });
+        } catch (_) {}
+      }
     }
   }
   if (!data) return captureDomSnapshot(tab, "screenshot capture returned empty image");
@@ -1095,22 +1246,28 @@ async function executeTool(name, args) {
         // well would pin the value and silently override the content script's
         // own default, which is where the real limit is decided.
         depth: args.depth,
+        rootSelector: args.rootSelector || null,
         maxChars: args.maxChars || args.max_chars || 50000
       }
     });
     if (!result?.ok) return toolError(result?.message || "read_page failed", result);
-    const state = result.result.pageState;
+    const page = result.result;
+    const state = page.pageState;
+    if (page.rootSelector && page.rootMatched === false) {
+      return toolError(`rootSelector matched nothing: ${page.rootSelector}`, { code: "NOT_FOUND" });
+    }
     return {
       content: [
         {
           type: "text",
           text: [
-            `URL: ${result.result.url}`,
-            `Title: ${result.result.title}`,
+            `URL: ${page.url}`,
+            `Title: ${page.title}`,
             state?.challenge ? `Challenge: ${state.challenge} — this is a bot check, not the page content` : null,
-            `Refs: ${result.result.entries.length}${result.result.truncated ? " (tree truncated)" : ""}`,
+            page.rootSelector ? `Scoped to: ${page.rootSelector}` : null,
+            `Refs: ${page.entries.length}${page.truncated ? ` (truncated, ${page.droppedLines} elements not shown)` : ""}`,
             "",
-            result.result.tree
+            page.tree
           ]
             .filter((line) => line !== null)
             .join("\n")
@@ -1157,10 +1314,47 @@ async function executeTool(name, args) {
     const injection = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: "MAIN",
-      func: async (source) => eval(source),
+      func: async (source) => {
+        // Report failures instead of letting them collapse into a bare null.
+        // A caller cannot otherwise tell "the code returned null" from "the code
+        // threw" from "the tool broke", and those need different fixes.
+        try {
+          const value = await eval(source);
+          if (value === undefined) return { ok: true, value: undefined };
+          try {
+            // Only values the extension boundary can clone survive the trip. A
+            // DOM node or a function would otherwise fail serialization and
+            // arrive as null, looking exactly like a legitimate null result.
+            structuredClone(value);
+            return { ok: true, value };
+          } catch (_) {
+            return { ok: true, value: String(value), notCloneable: true, type: typeof value };
+          }
+        } catch (error) {
+          return {
+            ok: false,
+            error: {
+              name: error?.name || "Error",
+              message: error?.message || String(error),
+              stack: typeof error?.stack === "string" ? error.stack.split("\n").slice(0, 6).join("\n") : undefined
+            }
+          };
+        }
+      },
       args: [text]
     });
-    return contentResult({ result: injection[0]?.result });
+    const frame = injection[0];
+    if (!frame) return toolError("script did not run in any frame", { code: "NO_FRAME" });
+    if (frame.result && frame.result.ok === false) {
+      const error = frame.result.error;
+      return toolError(`page threw ${error.name}: ${error.message}`, { code: "PAGE_ERROR", error });
+    }
+    // The {"result": ...} wrapping is a documented contract — callers parse it.
+    const payload = { result: frame.result ? frame.result.value : undefined };
+    if (frame.result?.notCloneable) {
+      payload.note = `value was a ${frame.result.type} that cannot cross the extension boundary; returned as a string`;
+    }
+    return contentResult(payload);
   }
 
   if (name === "computer") {
@@ -1224,13 +1418,121 @@ async function executeTool(name, args) {
         return contentResult({ pressed: true, key: args.text || args.key || "Enter" });
       }
       if (action === "scroll") {
-        const result = await sendToContent(tab.id, {
-          type: "atria.scroll",
-          direction: args.scroll_direction || args.direction || "down",
-          amount: args.scroll_amount || args.amount || 600
+        const scrolled = await scrollWheel(tab.id, args);
+        return contentResult({ scrolled: true, ...scrolled });
+      }
+      if (action === "scroll_until") {
+        // Virtual lists only load more rows in response to a real wheel event,
+        // and only the page can say whether the thing being waited for has
+        // arrived. Looping here keeps that to one call instead of one round
+        // trip per scroll step.
+        const maxSteps = Math.max(1, Math.min(Number(args.maxSteps || 20), 100));
+        const condition = { selector: args.selector, text: args.text };
+        if (!condition.selector && !condition.text) {
+          return toolError("scroll_until needs selector or text", { code: "BAD_ARGS" });
+        }
+        for (let step = 0; step < maxSteps; step++) {
+          const hit = await sendToContent(tab.id, { type: "atria.checkCondition", condition });
+          if (hit?.met) return contentResult({ found: true, steps: step, ...condition });
+          await scrollWheel(tab.id, args);
+          await sleep(Number(args.settleMs || 400));
+        }
+        const final = await sendToContent(tab.id, { type: "atria.checkCondition", condition });
+        if (final?.met) return contentResult({ found: true, steps: maxSteps, ...condition });
+        return toolError(`scroll_until gave up after ${maxSteps} steps`, { code: "NOT_FOUND", found: false, ...condition });
+      }
+      if (action === "act_until") {
+        // Locate, act, check, retry — in one call. Split across three calls the
+        // page moves in between, and the caller ends up hand-rolling a state
+        // machine: stale coordinates, a check that runs before the click has
+        // settled, a toggle driven the wrong way because the "did it work"
+        // condition was written for the opposite direction. untilGone exists
+        // for exactly that last case: deselect, close, collapse are as common
+        // as their opposites.
+        const attempts = Math.max(1, Math.min(Number(args.maxAttempts || 3), 10));
+        const settleMs = Number(args.settleMs || 800);
+        const op = args.op || "left_click";
+        const until = args.until || {};
+        const wantGone = Boolean(args.untilGone);
+        const hasCondition = Boolean(until.js || until.selector || until.text);
+
+        const holds = async () => {
+          if (until.js) {
+            const evaluated = await evaluatePredicateInPage(tab.id, until.js);
+            if (!evaluated?.ok) return { error: evaluated?.message || "until.js failed to evaluate" };
+            return { met: Boolean(evaluated.value) !== wantGone };
+          }
+          const checked = await sendToContent(tab.id, {
+            type: "atria.checkCondition",
+            condition: { selector: until.selector, text: until.text, gone: wantGone }
+          });
+          return { met: Boolean(checked?.met) };
+        };
+
+        if (hasCondition) {
+          // Already in the desired state: acting would toggle it back out.
+          const before = await holds();
+          if (before.error) return toolError(before.error, { code: "BAD_CONDITION" });
+          if (before.met) return contentResult({ ok: true, attempts: 0, alreadySatisfied: true });
+        }
+
+        let lastRect = null;
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+          const spot = args.ref
+            ? await sendToContent(tab.id, { type: "atria.refRect", ref: args.ref })
+            : await locateInPage(tab.id, args.selector || args.css, args.predicateJs);
+          if (!spot?.ok) {
+            if (attempt === attempts) return toolError(spot?.message || "target not found", { code: "NOT_FOUND", attempts: attempt });
+            await sleep(settleMs);
+            continue;
+          }
+          if (spot.covered) {
+            if (attempt === attempts) return toolError(`target is covered by <${spot.hit}>`, { code: "COVERED", ...spot });
+            await sleep(settleMs);
+            continue;
+          }
+          lastRect = { x: spot.x, y: spot.y, width: spot.width, height: spot.height };
+
+          if (op === "type") {
+            await clickAt(tab.id, { x: spot.x, y: spot.y });
+            await sleep(120);
+            await typeText(tab.id, args.text || "");
+          } else if (op === "key") {
+            await pressKey(tab.id, args.key || args.text || "Enter");
+          } else {
+            await clickAt(tab.id, { x: spot.x, y: spot.y }, op === "right_click" ? "right" : "left", op === "double_click" ? 2 : 1);
+          }
+          await sleep(settleMs);
+
+          if (!hasCondition) return contentResult({ ok: true, attempts: attempt, rectUsed: lastRect });
+          const after = await holds();
+          if (after.error) return toolError(after.error, { code: "BAD_CONDITION", attempts: attempt });
+          if (after.met) return contentResult({ ok: true, attempts: attempt, rectUsed: lastRect, untilGone: wantGone });
+        }
+        return toolError(`condition not satisfied after ${attempts} attempts`, {
+          code: "NOT_SATISFIED", ok: false, attempts, rectUsed: lastRect, untilGone: wantGone
         });
-        if (!result?.ok) return toolError(result?.message || "scroll failed", result);
-        return contentResult({ scrolled: true });
+      }
+      if (action === "click_where") {
+        // For targets the accessibility tree cannot name — canvas tiles, image
+        // grids, anything the page draws itself. Locate, scroll into view and
+        // click in one call, so the coordinates cannot go stale in between.
+        const found = await locateInPage(tab.id, args.selector, args.predicateJs);
+        if (!found?.ok) return toolError(found?.message || "click_where could not locate the element", { code: "NOT_FOUND" });
+        if (found.covered) {
+          return toolError(`target is covered by <${found.hit}> at (${found.x}, ${found.y})`, found);
+        }
+        await clickAt(tab.id, { x: found.x, y: found.y });
+        await sleep(Number(args.settleMs || 800));
+        let verified = null;
+        if (args.verifyJs) {
+          const check = await evaluatePredicateInPage(tab.id, args.verifyJs);
+          verified = Boolean(check?.value);
+          if (!verified) {
+            return toolError("clicked, but verifyJs did not hold afterwards", { clicked: true, verified: false, ...found });
+          }
+        }
+        return contentResult({ clicked: true, verified, rect: { x: found.x, y: found.y, width: found.width, height: found.height } });
       }
       if (action === "scroll_to") {
         const result = await sendToContent(tab.id, { type: "atria.scrollToRef", ref: args.ref });
@@ -1241,6 +1543,21 @@ async function executeTool(name, args) {
     } finally {
       await setIndicator(tab.id, false);
     }
+  }
+
+  if (name === "reload_extension") {
+    // Editing extension code does nothing until Chrome reloads it, and that is
+    // a manual click at chrome://extensions that no tool can reach — so an
+    // agent working on this bridge cannot verify its own changes. Reload from
+    // the inside instead. The service worker dies mid-call, so the result is
+    // posted first and the reload fires on the next tick.
+    setTimeout(() => chrome.runtime.reload(), 250);
+    return contentResult({
+      reloading: true,
+      version: EXTENSION_VERSION,
+      protocolVersion: PROTOCOL_VERSION,
+      note: "The extension is restarting. Wait ~2s, then check browser_status; content scripts re-inject on the next page load or tool call."
+    });
   }
 
   if (name === "export_session") {
@@ -1506,7 +1823,7 @@ async function pollOnce() {
   const response = await fetch(`${base}/extension/next?clientId=${encodeURIComponent(clientId)}&version=${encodeURIComponent(EXTENSION_VERSION)}&protocol=${PROTOCOL_VERSION}`, {
     cache: "no-store"
   });
-  if (response.status === 204) return;
+  if (response.status === 204) return false;
   if (!response.ok) throw new Error(`bridge HTTP ${response.status}`);
   const envelope = await response.json();
   const payload = await handleEnvelope(envelope).catch((error) => ({
@@ -1515,6 +1832,7 @@ async function pollOnce() {
     result: toolError(error?.message || String(error))
   }));
   await postJson("/extension/result", payload);
+  return true;
 }
 
 async function pollLoop() {
@@ -1522,8 +1840,14 @@ async function pollLoop() {
   polling = true;
   while (true) {
     try {
-      await pollOnce();
-      await sleep(350);
+      // Re-poll immediately after handling a command. /extension/next long-polls
+      // for up to 25s server-side, so this blocks there rather than spinning —
+      // whereas a fixed pause here was charged to every single command. It was
+      // 350ms, which was most of a local round trip, and a crawl pays it once
+      // per action. Only an empty poll backs off, and only enough to stop a
+      // tight loop if the server ever starts answering 204 immediately.
+      const handled = await pollOnce();
+      if (!handled) await sleep(50);
     } catch (_) {
       await sleep(1500);
     }
