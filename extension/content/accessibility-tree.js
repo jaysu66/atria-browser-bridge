@@ -205,8 +205,9 @@
       url: location.href,
       title: document.title,
       tree: text,
-      entries: state.entries.filter((entry) => entry.ref).slice(0, 500),
-      truncated
+      entries: state.entries.filter((entry) => entry.ref).slice(0, 2000),
+      truncated,
+      pageState: pageState()
     };
   }
 
@@ -333,6 +334,55 @@
     };
   }
 
+  // Heuristics for "this page is a bot check, not the content you asked for".
+  // Kept as a table so a new provider is one row, not a code change.
+  const CHALLENGE_RULES = [
+    { kind: "cloudflare", title: /just a moment|checking your browser|attention required/i, selector: "#cf-challenge-running, .cf-browser-verification, [class*='cf-chl'], #challenge-form" },
+    { kind: "generic_captcha", selector: "iframe[src*='recaptcha'], iframe[src*='hcaptcha'], iframe[title*='captcha' i], .g-recaptcha, .h-captcha" },
+    { kind: "generic_captcha", text: /verify (that )?you are (a )?human|are you a robot|请完成安全验证|人机验证/i }
+  ];
+
+  function detectChallenge() {
+    const title = document.title || "";
+    for (const rule of CHALLENGE_RULES) {
+      if (rule.title && rule.title.test(title)) return rule.kind;
+      if (rule.selector && document.querySelector(rule.selector)) return rule.kind;
+      if (rule.text) {
+        const body = (document.body?.innerText || "").slice(0, 4000);
+        if (rule.text.test(body)) return rule.kind;
+      }
+    }
+    return null;
+  }
+
+  function pageState() {
+    return {
+      challenge: detectChallenge(),
+      readyState: document.readyState,
+      url: location.href,
+      title: document.title
+    };
+  }
+
+  function checkCondition(cond) {
+    const state = pageState();
+    if (cond.challengeGone) return { met: !state.challenge, state };
+    if (cond.urlRegex) {
+      const met = new RegExp(cond.urlRegex).test(location.href);
+      return { met: cond.gone ? !met : met, state };
+    }
+    if (cond.selector) {
+      const found = Boolean(document.querySelector(cond.selector));
+      return { met: cond.gone ? !found : found, state };
+    }
+    if (cond.text) {
+      const body = document.body?.innerText || "";
+      const found = body.includes(String(cond.text));
+      return { met: cond.gone ? !found : found, state };
+    }
+    return { met: false, state, error: "no condition given" };
+  }
+
   function readValueByRef(ref) {
     const el = resolveRef(ref);
     if (!el) return { ok: false, code: "not_found", message: `ref not found: ${ref}` };
@@ -357,7 +407,7 @@
       if (message.type === "atria.getPageText") {
         const maxChars = Math.max(1000, Math.min(Number(message.maxChars || 50000), 200000));
         const text = (document.body?.innerText || "").replace(/\n{3,}/g, "\n\n");
-        sendResponse({ ok: true, result: { url: location.href, title: document.title, text: text.slice(0, maxChars), truncated: text.length > maxChars } });
+        sendResponse({ ok: true, result: { url: location.href, title: document.title, text: text.slice(0, maxChars), truncated: text.length > maxChars, pageState: pageState() } });
         return true;
       }
       if (message.type === "atria.find") {
@@ -366,6 +416,14 @@
       }
       if (message.type === "atria.formInput") {
         sendResponse(setValue(message.ref, message.value));
+        return true;
+      }
+      if (message.type === "atria.checkCondition") {
+        sendResponse({ ok: true, ...checkCondition(message.condition || {}) });
+        return true;
+      }
+      if (message.type === "atria.pageState") {
+        sendResponse({ ok: true, state: pageState() });
         return true;
       }
       if (message.type === "atria.refRect") {

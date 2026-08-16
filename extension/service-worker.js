@@ -739,7 +739,14 @@ async function extractPage(tab, args) {
       includeResources: args.includeResources ?? args.include_resources,
     }]
   });
-  return contentResult(injection[0]?.result || {});
+  const extracted = injection[0]?.result || {};
+  // Surface the bot-check verdict here too. A crawler that only calls
+  // extract_page would otherwise happily "extract" a challenge page.
+  try {
+    const state = await sendToContent(tab.id, { type: "atria.pageState" });
+    if (state?.ok) extracted.pageState = state.state;
+  } catch (_) {}
+  return contentResult(extracted);
 }
 
 async function captureScreenshot(tab) {
@@ -1008,6 +1015,36 @@ async function executeTool(name, args) {
     } finally {
       await setIndicator(tab.id, false);
     }
+  }
+
+  if (name === "wait_for") {
+    const tab = await resolveTab(args.tabId);
+    const timeoutMs = Math.max(1000, Math.min(Number(args.timeoutMs || 30000), 900000));
+    const pollMs = Math.max(200, Math.min(Number(args.pollMs || 1000), 10000));
+    const condition = {
+      text: args.text,
+      selector: args.selector,
+      urlRegex: args.urlRegex,
+      gone: Boolean(args.gone),
+      challengeGone: Boolean(args.challengeGone)
+    };
+    const deadline = Date.now() + timeoutMs;
+    let last = null;
+    while (Date.now() < deadline) {
+      try {
+        last = await sendToContent(tab.id, { type: "atria.checkCondition", condition });
+        if (last?.error) return toolError(last.error, { code: "BAD_ARGS" });
+        if (last?.met) {
+          return contentResult({ ok: true, waitedMs: timeoutMs - (deadline - Date.now()), state: last.state });
+        }
+      } catch (error) {
+        // A navigation tears the content script down mid-poll; that is expected
+        // while waiting for a page to change, so keep polling until the deadline.
+        last = { state: { error: error?.message || String(error) } };
+      }
+      await sleep(pollMs);
+    }
+    return toolError(`wait_for timed out after ${timeoutMs}ms`, { code: "TIMEOUT", ok: false, reason: "timeout", state: last?.state || null });
   }
 
   if (name === "cdp_tool") {

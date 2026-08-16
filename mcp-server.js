@@ -156,6 +156,15 @@ function attachExtensionSocket(req, socket) {
   });
 }
 
+// wait_for deliberately blocks until a page changes — often while a human
+// clears a bot check — so the transport must outlive its own timeout rather
+// than cutting the call off at the default and reporting a bridge failure.
+function timeoutFor(tool, args) {
+  if (tool !== 'wait_for') return REQUEST_TIMEOUT_MS;
+  const requested = Number(args?.timeoutMs || 30000);
+  return Math.min(Math.max(requested, 1000), 900000) + 15000;
+}
+
 function enqueueTool(tool, args) {
   const id = crypto.randomUUID();
   const envelope = { id, tool, args: args || {}, createdAt: new Date().toISOString() };
@@ -164,7 +173,7 @@ function enqueueTool(tool, args) {
     const timer = setTimeout(() => {
       pendingResults.delete(id);
       reject(new Error(`browser bridge timeout waiting for ${tool}`));
-    }, REQUEST_TIMEOUT_MS);
+    }, timeoutFor(tool, args));
     pendingResults.set(id, { resolve, reject, timer });
   });
 
@@ -472,6 +481,23 @@ const TOOLS = [
         },
       },
       required: ['actions'],
+    },
+  },
+  {
+    name: 'wait_for',
+    description: 'Block until a page condition holds, then return. Use challengeGone:true after read_page reports pageState.challenge — tell the user to solve the bot check, then wait instead of polling in a loop. Also waits on text, a CSS selector, or a URL pattern; set gone:true to wait for the condition to stop holding.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        text: { type: 'string', description: 'Wait until this text appears in the page body.' },
+        selector: { type: 'string', description: 'Wait until this CSS selector matches.' },
+        urlRegex: { type: 'string', description: 'Wait until the tab URL matches this pattern.' },
+        gone: { type: 'boolean', default: false, description: 'Invert: wait for the condition to stop holding.' },
+        challengeGone: { type: 'boolean', default: false, description: 'Wait until no bot-check page is detected.' },
+        timeoutMs: { type: 'number', default: 30000, description: 'Up to 900000. Use a long value when a human has to act.' },
+        pollMs: { type: 'number', default: 1000 },
+      },
     },
   },
   {
