@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <!-- Cloudflare 用的正是这个标题,pageState.challenge 应当报 "cloudflare"。 -->
+    <title>Just a moment...</title>
+    <style>
+      body { margin: 0; display: grid; place-items: center; height: 100vh;
+             font: 16px/1.5 system-ui, sans-serif; color: #313131; }
+      .box { text-align: center; max-width: 420px; }
+    </style>
+  </head>
+  <body>
+    <div class="box" id="cf-challenge-running">
+      <h1>Checking your browser before accessing the site.</h1>
+      <p>This process is automatic. Your browser will redirect shortly.</p>
+      <p><small>Verify you are human by completing the action below.</small></p>
+    </div>
+    <script>
+      // 手动清除挑战态,用于验证 wait_for({challengeGone:true}) 会返回。
+      // 在控制台执行 atriaClearChallenge() 即可。
+      window.atriaClearChallenge = () => {
+        document.title = "Cleared";
+        document.getElementById("cf-challenge-running").remove();
+        document.body.innerHTML = '<div class="box"><h1>Challenge cleared</h1></div>';
+      };
+    </script>
+  </body>
+</html>

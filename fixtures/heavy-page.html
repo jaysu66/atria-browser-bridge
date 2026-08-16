@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <title>Atria Heavy Page Fixture</title>
+    <!-- 被 set_request_blocking 屏蔽后,下面这些请求数应当归零。 -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter&display=swap">
+    <script src="https://example.com/analytics.js" async></script>
+  </head>
+  <body>
+    <h1>重资源页面</h1>
+    <p>用于验证 set_request_blocking:开启 image/font 屏蔽前后,network_list 里
+      对应 resourceType 的请求数应从若干条降为 0,且页面就绪更快。</p>
+    <img src="https://picsum.photos/1600/900" alt="大图 1" width="400">
+    <img src="https://picsum.photos/1200/800" alt="大图 2" width="400">
+    <img src="https://picsum.photos/800/600" alt="大图 3" width="400">
+    <script>
+      // 一个 XHR,供 network_start / network_detail 验证响应体抓取。
+      fetch("https://httpbin.org/json")
+        .then((r) => r.json())
+        .then((data) => {
+          document.title = "xhr done";
+          const pre = document.createElement("pre");
+          pre.id = "xhr-result";
+          pre.textContent = JSON.stringify(data).slice(0, 200);
+          document.body.appendChild(pre);
+        })
+        .catch(() => {
+          document.title = "xhr failed";
+        });
+    </script>
+  </body>
+</html>
