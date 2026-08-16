@@ -474,6 +474,80 @@ const TOOLS = [
       required: ['actions'],
     },
   },
+  {
+    name: 'cdp_tool',
+    description: 'Send a raw Chrome DevTools Protocol command to a tab. Escape hatch for anything the named tools do not cover (Page.printToPDF, Emulation.*, Runtime.evaluate with awaitPromise). Browser-process and target-lifecycle methods are refused.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        method: { type: 'string', description: 'CDP method, e.g. "Page.captureScreenshot"' },
+        params: { type: 'object' },
+      },
+      required: ['method'],
+    },
+  },
+  {
+    name: 'network_start',
+    description: 'Begin recording network requests for a tab. Most list pages are driven by XHR/fetch JSON — capturing it lets you read the API payload directly instead of parsing HTML.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        filter: { type: 'string', description: 'Default substring filter applied by network_list.' },
+      },
+    },
+  },
+  {
+    name: 'network_stop',
+    description: 'Stop recording network requests for a tab and discard the buffer.',
+    inputSchema: { type: 'object', properties: { tabId: { type: 'number' } } },
+  },
+  {
+    name: 'network_list',
+    description: 'List captured requests. Keeps the most recent 200 per tab; truncated:true means older entries were dropped.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        filter: { type: 'string', description: 'Substring matched against url, method, resourceType and status.' },
+      },
+    },
+  },
+  {
+    name: 'network_detail',
+    description: 'Full record for one captured request, optionally including the response body (capped at 1 MB).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        requestId: { type: 'string' },
+        includeBody: { type: 'boolean', default: false },
+      },
+      required: ['requestId'],
+    },
+  },
+  {
+    name: 'set_request_blocking',
+    description: 'Block resource types or URL patterns in a tab. Images, fonts and media are most of a page\'s bytes; dropping them makes crawling several times faster. Survives navigation until cleared.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        resourceTypes: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'CDP resource types, lowercased: image, font, media, stylesheet, script, xhr, fetch.',
+        },
+        urlPatterns: { type: 'array', items: { type: 'string' }, description: 'Glob-style patterns, e.g. "*analytics*".' },
+      },
+    },
+  },
+  {
+    name: 'clear_request_blocking',
+    description: 'Stop blocking requests in a tab and report how many were blocked.',
+    inputSchema: { type: 'object', properties: { tabId: { type: 'number' } } },
+  },
 ];
 
 const HANDLERS = Object.fromEntries(TOOLS.map((tool) => [tool.name, (args) => callBrowser(tool.name, args)]));

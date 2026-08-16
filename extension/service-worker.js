@@ -245,6 +245,122 @@ async function withDebugger(tabId, fn) {
   }
 }
 
+// Methods that would take the browser away from the user rather than drive a
+// page. The bridge exists to operate tabs, not to control the browser process.
+const CDP_DENIED = /^(Browser\.|Target\.(close|createTarget|disposeBrowserContext)|Page\.close|Storage\.clearDataForOrigin)/;
+
+// withDebugger attaches and detaches around a single call, which suits one-shot
+// commands but cannot receive events. Network capture and request blocking need
+// the attachment to outlive the call, so those tabs get a session here and the
+// attachment is released only when the last consumer stops.
+const cdpSessions = new Map();
+
+function cdpSession(tabId) {
+  let session = cdpSessions.get(tabId);
+  if (!session) {
+    session = { tabId, consumers: new Set(), network: null, blocking: null };
+    cdpSessions.set(tabId, session);
+  }
+  return session;
+}
+
+async function attachPersistent(tabId, consumer) {
+  const session = cdpSession(tabId);
+  if (!session.consumers.size) {
+    try {
+      await chrome.debugger.attach({ tabId }, "1.3");
+    } catch (error) {
+      if (!String(error?.message || error).includes("Another debugger is already attached")) throw error;
+    }
+  }
+  session.consumers.add(consumer);
+  return session;
+}
+
+async function detachPersistent(tabId, consumer) {
+  const session = cdpSessions.get(tabId);
+  if (!session) return;
+  session.consumers.delete(consumer);
+  if (session.consumers.size) return;
+  cdpSessions.delete(tabId);
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch (_) {}
+}
+
+function cdpSend(tabId, method, params) {
+  return chrome.debugger.sendCommand({ tabId }, method, params || {});
+}
+
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId !== undefined) cdpSessions.delete(source.tabId);
+});
+
+const NETWORK_MAX_RECORDS = 200;
+const NETWORK_MAX_BODY_BYTES = 1024 * 1024;
+
+function networkMatches(record, filter) {
+  if (!filter) return true;
+  const needle = String(filter).toLowerCase();
+  return `${record.url} ${record.method} ${record.resourceType} ${record.status || ""}`.toLowerCase().includes(needle);
+}
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  const session = source.tabId !== undefined ? cdpSessions.get(source.tabId) : null;
+  if (!session) return;
+
+  if (session.blocking && method === "Fetch.requestPaused") {
+    const { requestId, request, resourceType } = params || {};
+    const blocked =
+      session.blocking.resourceTypes.includes(String(resourceType || "").toLowerCase()) ||
+      session.blocking.urlPatterns.some((pattern) => pattern.test(request?.url || ""));
+    const command = blocked
+      ? cdpSend(source.tabId, "Fetch.failRequest", { requestId, errorReason: "BlockedByClient" })
+      : cdpSend(source.tabId, "Fetch.continueRequest", { requestId });
+    if (blocked) session.blocking.blocked += 1;
+    command.catch(() => {});
+    return;
+  }
+
+  const capture = session.network;
+  if (!capture) return;
+
+  if (method === "Network.requestWillBeSent") {
+    if (capture.records.length >= NETWORK_MAX_RECORDS) {
+      capture.records.shift();
+      capture.truncated = true;
+    }
+    capture.records.push({
+      requestId: params.requestId,
+      url: params.request?.url || "",
+      method: params.request?.method || "",
+      resourceType: String(params.type || "").toLowerCase(),
+      requestHeaders: params.request?.headers || {},
+      postData: params.request?.postData ? String(params.request.postData).slice(0, 4000) : undefined,
+      startedAt: params.wallTime,
+      status: null
+    });
+    return;
+  }
+  if (method === "Network.responseReceived") {
+    const record = capture.records.find((item) => item.requestId === params.requestId);
+    if (record) {
+      record.status = params.response?.status ?? null;
+      record.mimeType = params.response?.mimeType || "";
+      record.responseHeaders = params.response?.headers || {};
+    }
+    return;
+  }
+  if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
+    const record = capture.records.find((item) => item.requestId === params.requestId);
+    if (record) {
+      record.finished = true;
+      record.encodedDataLength = params.encodedDataLength;
+      if (method === "Network.loadingFailed") record.failed = params.errorText || "failed";
+    }
+  }
+});
+
 async function clickAt(tabId, coordinate, button = "left", clickCount = 1) {
   const x = Math.round(Number(coordinate?.x ?? coordinate?.[0]));
   const y = Math.round(Number(coordinate?.y ?? coordinate?.[1]));
@@ -892,6 +1008,119 @@ async function executeTool(name, args) {
     } finally {
       await setIndicator(tab.id, false);
     }
+  }
+
+  if (name === "cdp_tool") {
+    const tab = await resolveTab(args.tabId);
+    const method = String(args.method || "");
+    if (!method) return toolError("method is required", { code: "BAD_ARGS" });
+    if (CDP_DENIED.test(method)) {
+      return toolError(`CDP method refused: ${method}. This bridge drives pages, not the browser process.`, { code: "CDP_REFUSED" });
+    }
+    // Reuse a persistent session when one exists so capture and blocking are not
+    // torn down by a one-shot call attaching and detaching underneath them.
+    if (cdpSessions.has(tab.id)) {
+      const result = await cdpSend(tab.id, method, args.params || {});
+      return contentResult({ method, result });
+    }
+    const result = await withDebugger(tab.id, (cdp) => cdp(method, args.params || {}));
+    return contentResult({ method, result });
+  }
+
+  if (name === "network_start") {
+    const tab = await resolveTab(args.tabId);
+    const session = await attachPersistent(tab.id, "network");
+    session.network = { records: [], truncated: false, filter: args.filter || null };
+    await cdpSend(tab.id, "Network.enable", {});
+    return contentResult({ capturing: true, tabId: tab.id, maxRecords: NETWORK_MAX_RECORDS });
+  }
+
+  if (name === "network_stop") {
+    const tab = await resolveTab(args.tabId);
+    const session = cdpSessions.get(tab.id);
+    if (!session?.network) return contentResult({ capturing: false, tabId: tab.id });
+    const captured = session.network.records.length;
+    session.network = null;
+    try {
+      await cdpSend(tab.id, "Network.disable", {});
+    } catch (_) {}
+    await detachPersistent(tab.id, "network");
+    return contentResult({ capturing: false, tabId: tab.id, captured });
+  }
+
+  if (name === "network_list") {
+    const tab = await resolveTab(args.tabId);
+    const capture = cdpSessions.get(tab.id)?.network;
+    if (!capture) return toolError("network capture is not running for this tab; call network_start first", { code: "NOT_CAPTURING" });
+    const filter = args.filter || capture.filter;
+    const rows = capture.records.filter((record) => networkMatches(record, filter));
+    return contentResult({
+      tabId: tab.id,
+      truncated: capture.truncated,
+      total: capture.records.length,
+      matched: rows.length,
+      requests: rows.map((record) => ({
+        requestId: record.requestId,
+        method: record.method,
+        status: record.status,
+        resourceType: record.resourceType,
+        mimeType: record.mimeType,
+        bytes: record.encodedDataLength,
+        failed: record.failed,
+        url: record.url
+      }))
+    });
+  }
+
+  if (name === "network_detail") {
+    const tab = await resolveTab(args.tabId);
+    const capture = cdpSessions.get(tab.id)?.network;
+    if (!capture) return toolError("network capture is not running for this tab; call network_start first", { code: "NOT_CAPTURING" });
+    const record = capture.records.find((item) => item.requestId === args.requestId);
+    if (!record) return toolError(`unknown requestId: ${args.requestId}`, { code: "NOT_FOUND" });
+    const detail = { ...record };
+    if (args.includeBody) {
+      try {
+        const body = await cdpSend(tab.id, "Network.getResponseBody", { requestId: args.requestId });
+        const text = String(body?.body || "");
+        detail.body = text.slice(0, NETWORK_MAX_BODY_BYTES);
+        detail.bodyBase64Encoded = Boolean(body?.base64Encoded);
+        detail.bodyTruncated = text.length > NETWORK_MAX_BODY_BYTES;
+      } catch (error) {
+        detail.bodyError = error?.message || String(error);
+      }
+    }
+    return contentResult(detail);
+  }
+
+  if (name === "set_request_blocking") {
+    const tab = await resolveTab(args.tabId);
+    const resourceTypes = (args.resourceTypes || []).map((item) => String(item).toLowerCase());
+    const urlPatterns = (args.urlPatterns || []).map(
+      (pattern) => new RegExp(String(pattern).replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*"), "i")
+    );
+    if (!resourceTypes.length && !urlPatterns.length) {
+      return toolError("give at least one of resourceTypes or urlPatterns", { code: "BAD_ARGS" });
+    }
+    const session = await attachPersistent(tab.id, "blocking");
+    session.blocking = { resourceTypes, urlPatterns, blocked: 0 };
+    // Fetch.enable pauses every request so the handler can decide. Patterns stay
+    // wide open here because resourceType filtering happens in the handler.
+    await cdpSend(tab.id, "Fetch.enable", { patterns: [{ urlPattern: "*" }] });
+    return contentResult({ blocking: true, tabId: tab.id, resourceTypes, urlPatterns: args.urlPatterns || [] });
+  }
+
+  if (name === "clear_request_blocking") {
+    const tab = await resolveTab(args.tabId);
+    const session = cdpSessions.get(tab.id);
+    if (!session?.blocking) return contentResult({ blocking: false, tabId: tab.id });
+    const blocked = session.blocking.blocked;
+    session.blocking = null;
+    try {
+      await cdpSend(tab.id, "Fetch.disable", {});
+    } catch (_) {}
+    await detachPersistent(tab.id, "blocking");
+    return contentResult({ blocking: false, tabId: tab.id, blocked });
   }
 
   if (name === "browser_batch") {
