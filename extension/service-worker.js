@@ -1235,6 +1235,46 @@ async function executeTool(name, args) {
     }
   }
 
+  if (name === "export_session") {
+    const stored = await chrome.storage.local.get("atriaAllowSessionExport");
+    if (!stored.atriaAllowSessionExport) {
+      return toolError(
+        "Session export is off. It hands out the site's login credentials in cleartext, so it stays behind an explicit switch: open the Atria extension popup and enable “允许导出登录态”.",
+        { code: "PERMISSION_DENIED" }
+      );
+    }
+    let origin = args.origin;
+    let tab = null;
+    if (!origin) {
+      tab = await resolveTab(args.tabId);
+      try {
+        origin = new URL(tab.url).origin;
+      } catch (_) {
+        return toolError("cannot determine an origin from the tab; pass origin explicitly", { code: "BAD_ARGS" });
+      }
+    }
+    const cookies = await chrome.cookies.getAll({ url: origin });
+    const userAgent = await withDebugger((tab || (await resolveTab(args.tabId))).id, async (cdp) => {
+      const result = await cdp("Runtime.evaluate", { expression: "navigator.userAgent", returnByValue: true });
+      return result?.result?.value || "";
+    });
+    return contentResult({
+      origin,
+      userAgent,
+      cookieCount: cookies.length,
+      cookieHeader: cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; "),
+      cookies: cookies.map((cookie) => ({
+        name: cookie.name,
+        value: cookie.value,
+        domain: cookie.domain,
+        path: cookie.path,
+        secure: cookie.secure,
+        httpOnly: cookie.httpOnly,
+        expirationDate: cookie.expirationDate
+      }))
+    });
+  }
+
   if (name === "save_as_pdf") {
     const tab = await resolveTab(args.tabId);
     const result = await withDebugger(tab.id, async (cdp) => {

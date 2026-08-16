@@ -489,6 +489,17 @@ const TOOLS = [
     },
   },
   {
+    name: 'export_session',
+    description: 'Export cookies and user agent for an origin so bulk fetching can move to a plain HTTP client, which is far faster than driving pages. Off by default and refused with PERMISSION_DENIED until the user enables it in the extension popup — the export is the site\'s login credentials in cleartext.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'number' },
+        origin: { type: 'string', description: 'Origin to export. Defaults to the tab\'s own origin.' },
+      },
+    },
+  },
+  {
     name: 'save_as_pdf',
     description: 'Render a tab to PDF via CDP and return it. Useful for archiving evidence of a page exactly as it rendered.',
     inputSchema: {
@@ -710,7 +721,7 @@ rl.on('line', async (line) => {
       result: {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'atria-browser-bridge', version: '0.1.0' },
+        serverInfo: { name: 'atria-browser-bridge', version: '0.2.0' },
       },
     });
     return;

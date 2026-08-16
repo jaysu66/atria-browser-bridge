@@ -1,6 +1,6 @@
 {
   "name": "atria-browser-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "An MCP server + Chrome extension that gives any AI agent eyes and hands in your real, logged-in browser. Zero dependencies.",
   "type": "commonjs",
   "bin": {
